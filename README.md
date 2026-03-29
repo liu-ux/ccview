@@ -37,10 +37,9 @@ sudo mv ccview /usr/local/bin/
 **Windows (PowerShell)**
 
 ```powershell
-# Download the latest .zip from https://github.com/shivamstaq/ccview/releases/latest
-# Extract and add ccview.exe to your PATH
-Invoke-WebRequest -Uri "https://github.com/shivamstaq/ccview/releases/latest" -OutFile ccview.zip
-Expand-Archive ccview.zip -DestinationPath "$env:LOCALAPPDATA\ccview"
+$version = (Invoke-RestMethod "https://api.github.com/repos/shivamstaq/ccview/releases/latest").tag_name -replace '^v',''
+Invoke-WebRequest -Uri "https://github.com/shivamstaq/ccview/releases/latest/download/ccview_${version}_windows_amd64.zip" -OutFile ccview.zip
+Expand-Archive ccview.zip -DestinationPath "$env:LOCALAPPDATA\ccview" -Force
 # Add $env:LOCALAPPDATA\ccview to your PATH
 ```
 
