@@ -1,90 +1,109 @@
-# claude-log
+# ccview
 
-A terminal-based explorer and renderer for Claude Code conversation histories. Browse projects, view conversations with proper markdown rendering, inspect sub-agents, and export to HTML.
+A terminal-based explorer and renderer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) conversation histories. Browse projects, view conversations with markdown rendering, inspect sub-agents, and export to HTML/Markdown/JSONL.
 
 Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), and [Glamour](https://github.com/charmbracelet/glamour).
 
+![ccview demo](.github/demo.png)
+
 ## Install
 
-```bash
-go install claude-log@latest
-```
+### From source (recommended)
 
-Or build from source:
+Requires [Go 1.23+](https://go.dev/dl/).
 
 ```bash
-git clone <repo>
-cd claude-log
-go build -o claude-log .
+git clone https://github.com/YOUR_USERNAME/ccview.git
+cd ccview
+go build -o ccview .
 ```
 
-## Usage
+Optionally move the binary to your PATH:
+
+```bash
+sudo mv ccview /usr/local/bin/
+```
+
+### Via `go install`
+
+```bash
+go install github.com/YOUR_USERNAME/ccview@latest
+```
+
+## Quick Start
+
+```bash
+# Launch the interactive TUI explorer
+ccview
+
+# Start the web UI
+ccview --web
+
+# View a specific conversation file
+ccview --file path/to/conversation.jsonl
+
+# Export a conversation to HTML
+ccview --export output.html --file path/to/conversation.jsonl
+```
+
+## Features
 
 ### TUI Explorer (default)
 
 ```bash
-./claude-log
+ccview
 ```
 
-Split-pane interactive explorer. Left pane shows the project tree, right pane renders content.
+Split-pane interactive explorer. Left pane shows the project tree with conversations, plans, and memory files. Right pane renders conversation content with syntax-highlighted markdown.
 
-```
- Claude Code Explorer
-EXPLORER                          |  tidy-marinating-dragon
-──────────────────────────────────|  ──────────────────────────────
-v ~/Work/project                  |  ─────────────────────────────
-    CLAUDE.md                     |   USER  14:30:05
-    MEMORY.md                     |
-  * tidy-marinating-dragon  202   |    What is the meaning of life?
-      Explore: a236375c           |
-      General: aed6d1cb           |  ─────────────────────────────
-v ~/other-project                 |   ASSISTANT  claude-opus-4-6
-  > toasty-yawning-hanrahan       |
-                                  |    The meaning of life is...
-```
+- Conversations sorted newest-first with smart timestamps
+- Sub-agents collapsed by default, expand on selection
+- Global plans shown in sidebar
+- Tool calls wrap cleanly with aligned continuation lines
+- Press `o` to open any file in your `$EDITOR`
+- Press `e` for a guided export wizard (format, path, filename)
 
 ### Web Explorer
 
 ```bash
-./claude-log --web
-./claude-log --web --port 8080
+ccview --web
+ccview --web --port 8080
 ```
 
-Opens an interactive web UI at `http://localhost:3333` with Claude's color scheme. Features a tree sidebar for navigation and a content viewer with collapsible thinking blocks, tool call cards, and token usage.
+Opens an interactive web UI at `http://localhost:3333` with collapsible thinking blocks, tool call cards, and token usage display.
 
-### Direct File
+### Export
+
+Press `e` in the TUI to open the export wizard, or use the CLI:
 
 ```bash
-./claude-log --file path/to/conversation.jsonl
+ccview --export output.html --file conversation.jsonl
 ```
 
-Opens a specific JSONL file directly in the TUI viewer (full-width, no tree).
+**Supported formats:**
+- **HTML** - Dark-themed, self-contained, syntax-highlighted
+- **Markdown** - Clean readable markdown with headers and blockquoted tool calls
+- **JSONL** - Raw copy of the original conversation file
 
-### HTML Export
+For full conversations with sub-agents, HTML export creates a directory with `index.html` linking to individual sub-agent pages.
 
-```bash
-./claude-log --export output.html --file path/to/conversation.jsonl
-```
+## Keybindings
 
-Generates a self-contained HTML file with dark theme, syntax-highlighted code blocks, and collapsible thinking sections.
-
-## TUI Keybindings
-
-### Tree Pane
+### Sidebar
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate up/down |
-| `Enter` | Open conversation or file in viewer |
-| `Space` | Expand/collapse project or conversation |
-| `l` / `Right` | Expand node or switch to viewer |
-| `h` / `Left` | Collapse node |
+| `Enter` | Open conversation / expand sub-agents |
+| `l` / `Right` | Switch to viewer |
+| `h` / `Left` / `Esc` | Back to project list |
 | `Tab` | Switch to viewer pane |
-| `e` | Export selected conversation to HTML |
+| `e` | Export wizard |
+| `o` | Open in `$EDITOR` |
 | `g` / `G` | Jump to top/bottom |
 | `q` | Quit |
 
-### Viewer Pane
+### Viewer
 
 | Key | Action |
 |-----|--------|
@@ -92,29 +111,14 @@ Generates a self-contained HTML file with dark theme, syntax-highlighted code bl
 | `Space` / `f` | Page down |
 | `b` | Page up |
 | `g` / `G` | Jump to top/bottom |
-| `Tab` / `h` | Switch to tree pane |
-| `e` | Export current conversation to HTML |
+| `Tab` / `h` | Switch to sidebar |
+| `e` | Export wizard |
+| `o` | Open in `$EDITOR` |
 | `q` | Quit |
 
-## Data Hierarchy
+## What it reads
 
-claude-log reads from `~/.claude/` and organizes data as:
-
-```
-Global
-  CLAUDE.md (global instructions)
-  Plans (markdown plan documents)
-
-Project: ~/path/to/project
-  CLAUDE.md (project instructions)
-  Memory files (persistent knowledge)
-  Conversations:
-    session-slug (N messages, M sub-agents)
-      Sub-agent: Explore
-      Sub-agent: General
-```
-
-### What it reads
+ccview reads from `~/.claude/` and organizes data as:
 
 | Source | Description |
 |--------|-------------|
@@ -125,14 +129,13 @@ Project: ~/path/to/project
 | `*/memory/*.md` | Per-project memory files |
 | `*/CLAUDE.md` | Project-level instructions |
 | `~/.claude/plans/*.md` | Plan documents |
-| `~/.claude/file-history/` | File edit counts per session |
 
-### Message Types Rendered
+### Message types rendered
 
-- **User messages** - with glamour markdown rendering
-- **Assistant messages** - with model name, markdown rendering, token usage
-- **Thinking blocks** - truncated in TUI, collapsible in web
-- **Tool calls** - summarized (Read, Write, Edit, Bash, Grep, Glob, Agent, etc.)
+- **User messages** - with markdown rendering
+- **Assistant messages** - with model name, markdown, token usage
+- **Thinking blocks** - truncated in TUI, collapsible in web/HTML
+- **Tool calls** - summarized with wrapped overflow (Read, Write, Edit, Bash, Grep, Glob, Agent, etc.)
 - **System messages** - slash commands shown inline
 
 ## Architecture
@@ -142,8 +145,8 @@ main.go       CLI entry point, flag parsing
 data.go       Tree types, project scanning, filesystem loading
 parse.go      JSONL parsing, glamour rendering, formatting helpers
 ui.go         Bubble Tea TUI with split-pane layout
-server.go     HTTP server with embedded SPA (Claude color scheme)
-export.go     Static HTML export with goldmark markdown
+server.go     HTTP server with embedded SPA
+export.go     HTML/Markdown/JSONL export
 ```
 
 ## Dependencies
@@ -151,4 +154,9 @@ export.go     Static HTML export with goldmark markdown
 - [charm.land/bubbletea/v2](https://github.com/charmbracelet/bubbletea) - TUI framework
 - [charm.land/lipgloss/v2](https://github.com/charmbracelet/lipgloss) - Terminal styling
 - [github.com/charmbracelet/glamour](https://github.com/charmbracelet/glamour) - Terminal markdown rendering
+- [github.com/charmbracelet/x/ansi](https://github.com/charmbracelet/x) - ANSI-aware string handling
 - [github.com/yuin/goldmark](https://github.com/yuin/goldmark) - HTML markdown rendering
+
+## License
+
+[MIT](LICENSE)

@@ -2,11 +2,16 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ── States ──
@@ -28,7 +33,7 @@ const (
 
 // sidebarItem is a single navigable row in the project detail sidebar.
 type sidebarItem struct {
-	kind  string // "back", "file", "conversation", "subagent", "separator"
+	kind  string // "back", "file", "conversation", "subagent", "separator", "header"
 	label string
 	path  string
 	badge string
@@ -46,12 +51,13 @@ type model struct {
 	projOffset int
 
 	// Project detail screen
-	activePane    pane
-	projIndex     int          // index into tree.Projects
-	currentProj   *TreeProject // pointer to selected project
-	sidebar       []sidebarItem
-	sidebarCursor int
-	sidebarOffset int
+	activePane       pane
+	projIndex        int          // index into tree.Projects
+	currentProj      *TreeProject // pointer to selected project
+	sidebar          []sidebarItem
+	sidebarCursor    int
+	sidebarOffset    int
+	expandedConvPath string // which conversation's subagents are visible
 
 	// Content pane
 	contentLines  []string
@@ -63,6 +69,53 @@ type model struct {
 	directFile string
 	err        error
 	statusMsg  string
+
+	// Export overlay
+	export exportState
+}
+
+// ── Export overlay types ──
+
+type exportStep int
+
+const (
+	exportStepWhat     exportStep = iota
+	exportStepFormat
+	exportStepPath
+	exportStepFilename
+	exportStepConfirm
+)
+
+type exportWhat int
+
+const (
+	exportFullConversation exportWhat = iota
+	exportMainThread
+	exportSelectedSubagent
+)
+
+type exportFormat int
+
+const (
+	exportFormatHTML exportFormat = iota
+	exportFormatMarkdown
+	exportFormatJSONL
+)
+
+type exportState struct {
+	active           bool
+	step             exportStep
+	what             exportWhat
+	whatCursor       int
+	format           exportFormat
+	formatCursor     int
+	pathBuf          []rune
+	pathCurPos       int
+	filenameBuf      []rune
+	filenameCurPos   int
+	sourcePath       string
+	sourceLabel      string
+	convHasSubagents bool
 }
 
 // ── Messages ──
@@ -79,6 +132,15 @@ type contentLoadedMsg struct {
 	err   error
 }
 type statusClearMsg struct{}
+
+type exportDoneMsg struct {
+	outPath string
+	err     error
+}
+
+type editorFinishedMsg struct {
+	err error
+}
 
 // ── Styles ──
 
@@ -204,7 +266,7 @@ func loadFileCmd(path, title string, width int) tea.Cmd {
 
 // ── Sidebar builder ──
 
-func buildSidebar(proj *TreeProject) []sidebarItem {
+func buildSidebar(proj *TreeProject, plans []TreeFileRef, expandedConvPath string) []sidebarItem {
 	items := []sidebarItem{
 		{kind: "back", label: "< Back to Projects"},
 		{kind: "separator"},
@@ -220,6 +282,15 @@ func buildSidebar(proj *TreeProject) []sidebarItem {
 		items = append(items, sidebarItem{kind: "separator"})
 	}
 
+	// Plans (global)
+	if len(plans) > 0 {
+		items = append(items, sidebarItem{kind: "header", label: "PLANS"})
+		for _, plan := range plans {
+			items = append(items, sidebarItem{kind: "file", label: plan.Name, path: plan.Path})
+		}
+		items = append(items, sidebarItem{kind: "separator"})
+	}
+
 	for _, conv := range proj.Conversations {
 		title := conv.Title
 		if title == "" {
@@ -228,26 +299,33 @@ func buildSidebar(proj *TreeProject) []sidebarItem {
 		if title == "" && len(conv.SessionID) >= 8 {
 			title = conv.SessionID[:8]
 		}
+		badge := fmt.Sprintf("%s  %d msgs", formatDateSmart(conv.ModTime), conv.MsgCount)
+		if len(conv.SubAgents) > 0 {
+			badge = fmt.Sprintf("%s  %d msgs · %d agents", formatDateSmart(conv.ModTime), conv.MsgCount, len(conv.SubAgents))
+		}
 		items = append(items, sidebarItem{
 			kind:  "conversation",
 			label: title,
 			path:  conv.Path,
-			badge: fmt.Sprintf("%d msgs", conv.MsgCount),
+			badge: badge,
 		})
-		for _, sa := range conv.SubAgents {
-			desc := sa.Description
-			if desc == "" {
-				desc = sa.Name
+		// Only show subagents for the expanded conversation
+		if conv.Path == expandedConvPath {
+			for _, sa := range conv.SubAgents {
+				desc := sa.Description
+				if desc == "" {
+					desc = sa.Name
+				}
+				at := sa.AgentType
+				if at == "" {
+					at = "agent"
+				}
+				lbl := at + ": " + desc
+				if len(lbl) > 55 {
+					lbl = lbl[:52] + "..."
+				}
+				items = append(items, sidebarItem{kind: "subagent", label: lbl, path: sa.Path})
 			}
-			at := sa.AgentType
-			if at == "" {
-				at = "agent"
-			}
-			lbl := at + ": " + desc
-			if len(lbl) > 55 {
-				lbl = lbl[:52] + "..."
-			}
-			items = append(items, sidebarItem{kind: "subagent", label: lbl, path: sa.Path})
 		}
 	}
 	return items
@@ -255,7 +333,7 @@ func buildSidebar(proj *TreeProject) []sidebarItem {
 
 // navigable returns true if the sidebar item can be selected with cursor.
 func (si sidebarItem) navigable() bool {
-	return si.kind != "separator"
+	return si.kind != "separator" && si.kind != "header"
 }
 
 // nextNavigable returns the next navigable index from pos in direction dir (+1/-1).
@@ -314,9 +392,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMsg = ""
 		return m, nil
 
+	case exportDoneMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Export error: %v", msg.err)
+		} else {
+			m.statusMsg = fmt.Sprintf("Exported to %s", msg.outPath)
+		}
+		return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return statusClearMsg{} })
+
+	case editorFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Editor error: %v", msg.err)
+			return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return statusClearMsg{} })
+		}
+		return m, nil
+
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+		// Export overlay intercepts all keys when active
+		if m.export.active {
+			return m.updateExportOverlay(msg)
 		}
 		switch m.state {
 		case viewProjectList:
@@ -385,7 +482,8 @@ func (m *model) openProject(idx int) {
 	}
 	m.projIndex = idx
 	m.currentProj = &m.tree.Projects[idx]
-	m.sidebar = buildSidebar(m.currentProj)
+	m.expandedConvPath = ""
+	m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
 	m.sidebarCursor = 0
 	// Move cursor to first navigable item
 	if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
@@ -406,13 +504,13 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "esc", "backspace", "h", "left":
-		// If on "back" item or Esc, go back
 		m.state = viewProjectList
 		m.currentProj = nil
 		m.sidebar = nil
 		m.contentLines = nil
 		m.contentTitle = ""
 		m.contentPath = ""
+		m.expandedConvPath = ""
 		return m, nil
 	case "up", "k":
 		m.sidebarCursor = nextNavigable(m.sidebar, m.sidebarCursor, -1)
@@ -435,8 +533,22 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.currentProj = nil
 				m.sidebar = nil
 				m.contentLines = nil
+				m.expandedConvPath = ""
 				return m, nil
-			case "conversation", "subagent":
+			case "conversation":
+				m.expandedConvPath = item.path
+				m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
+				// Find cursor for the expanded conversation
+				for i, si := range m.sidebar {
+					if si.path == item.path && si.kind == "conversation" {
+						m.sidebarCursor = i
+						break
+					}
+				}
+				m.contentTitle = item.label
+				m.contentLines = nil
+				return m, loadConvCmd(item.path, item.label, rightW)
+			case "subagent":
 				m.contentTitle = item.label
 				m.contentLines = nil
 				return m, loadConvCmd(item.path, item.label, rightW)
@@ -450,18 +562,24 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.sidebarCursor < len(m.sidebar) {
 			item := m.sidebar[m.sidebarCursor]
 			if item.kind == "conversation" || item.kind == "subagent" {
-				return m, doExport(item.path)
+				m.initExportOverlay(item.path, item.label)
+				return m, nil
+			}
+		}
+	case "o":
+		if m.sidebarCursor < len(m.sidebar) {
+			item := m.sidebar[m.sidebarCursor]
+			if item.path != "" {
+				return m, openInEditor(item.path)
 			}
 		}
 	}
 
 	// Keep cursor visible
-	leftW, _ := m.paneWidths()
-	sidebarH := m.height - 5 // title + project name + separator + status
+	sidebarH := m.height - 5
 	if sidebarH < 1 {
 		sidebarH = 1
 	}
-	_ = leftW
 	if m.sidebarCursor < m.sidebarOffset {
 		m.sidebarOffset = m.sidebarCursor
 	}
@@ -512,22 +630,334 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.activePane = paneSidebar
 	case "e":
 		if m.contentPath != "" && m.contentKind == "conversation" {
-			return m, doExport(m.contentPath)
+			m.initExportOverlay(m.contentPath, m.contentTitle)
+			return m, nil
+		}
+	case "o":
+		if m.contentPath != "" {
+			return m, openInEditor(m.contentPath)
 		}
 	}
 	return m, nil
 }
 
-func doExport(path string) tea.Cmd {
-	return func() tea.Msg {
-		entries, err := parseConversation(path)
-		if err != nil {
-			return statusClearMsg{}
+// ── Export overlay ──
+
+func (m *model) initExportOverlay(sourcePath, label string) {
+	cwd, _ := os.Getwd()
+	defaultFilename := fmt.Sprintf("ccview-export-%s.html", time.Now().Format("20060102-150405"))
+
+	hasSubagents := false
+	if m.currentProj != nil {
+		for _, conv := range m.currentProj.Conversations {
+			if conv.Path == sourcePath && len(conv.SubAgents) > 0 {
+				hasSubagents = true
+				break
+			}
 		}
-		outPath := fmt.Sprintf("claude-conversation-%s.html", time.Now().Format("20060102-150405"))
-		exportHTML(entries, outPath, path)
-		return statusClearMsg{}
 	}
+
+	m.export = exportState{
+		active:           true,
+		step:             exportStepWhat,
+		sourcePath:       sourcePath,
+		sourceLabel:      label,
+		convHasSubagents: hasSubagents,
+		pathBuf:          []rune(cwd),
+		pathCurPos:       len([]rune(cwd)),
+		filenameBuf:      []rune(defaultFilename),
+		filenameCurPos:   len([]rune(defaultFilename)),
+	}
+}
+
+func (m model) updateExportOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if key == "esc" {
+		m.export.active = false
+		return m, nil
+	}
+
+	switch m.export.step {
+	case exportStepWhat:
+		maxOpt := 2 // full, main-only
+		if m.export.convHasSubagents {
+			maxOpt = 3
+		}
+		switch key {
+		case "up", "k":
+			if m.export.whatCursor > 0 {
+				m.export.whatCursor--
+			}
+		case "down", "j":
+			if m.export.whatCursor < maxOpt-1 {
+				m.export.whatCursor++
+			}
+		case "enter":
+			m.export.what = exportWhat(m.export.whatCursor)
+			m.export.step = exportStepFormat
+		}
+
+	case exportStepFormat:
+		switch key {
+		case "up", "k":
+			if m.export.formatCursor > 0 {
+				m.export.formatCursor--
+			}
+		case "down", "j":
+			if m.export.formatCursor < 2 {
+				m.export.formatCursor++
+			}
+		case "enter":
+			m.export.format = exportFormat(m.export.formatCursor)
+			// Update filename extension
+			m.updateExportFilenameExt()
+			m.export.step = exportStepPath
+		case "backspace":
+			m.export.step = exportStepWhat
+		}
+
+	case exportStepPath:
+		switch key {
+		case "enter":
+			m.export.step = exportStepFilename
+		case "backspace":
+			if m.export.pathCurPos > 0 {
+				m.export.pathBuf = append(m.export.pathBuf[:m.export.pathCurPos-1], m.export.pathBuf[m.export.pathCurPos:]...)
+				m.export.pathCurPos--
+			} else {
+				m.export.step = exportStepFormat
+			}
+		case "left":
+			if m.export.pathCurPos > 0 {
+				m.export.pathCurPos--
+			}
+		case "right":
+			if m.export.pathCurPos < len(m.export.pathBuf) {
+				m.export.pathCurPos++
+			}
+		case "home", "ctrl+a":
+			m.export.pathCurPos = 0
+		case "end", "ctrl+e":
+			m.export.pathCurPos = len(m.export.pathBuf)
+		default:
+			r := []rune(key)
+			if len(r) == 1 && r[0] >= 32 {
+				m.export.pathBuf = append(m.export.pathBuf[:m.export.pathCurPos], append([]rune{r[0]}, m.export.pathBuf[m.export.pathCurPos:]...)...)
+				m.export.pathCurPos++
+			}
+		}
+
+	case exportStepFilename:
+		switch key {
+		case "enter":
+			m.export.step = exportStepConfirm
+		case "backspace":
+			if m.export.filenameCurPos > 0 {
+				m.export.filenameBuf = append(m.export.filenameBuf[:m.export.filenameCurPos-1], m.export.filenameBuf[m.export.filenameCurPos:]...)
+				m.export.filenameCurPos--
+			} else {
+				m.export.step = exportStepPath
+			}
+		case "left":
+			if m.export.filenameCurPos > 0 {
+				m.export.filenameCurPos--
+			}
+		case "right":
+			if m.export.filenameCurPos < len(m.export.filenameBuf) {
+				m.export.filenameCurPos++
+			}
+		case "home", "ctrl+a":
+			m.export.filenameCurPos = 0
+		case "end", "ctrl+e":
+			m.export.filenameCurPos = len(m.export.filenameBuf)
+		default:
+			r := []rune(key)
+			if len(r) == 1 && r[0] >= 32 {
+				m.export.filenameBuf = append(m.export.filenameBuf[:m.export.filenameCurPos], append([]rune{r[0]}, m.export.filenameBuf[m.export.filenameCurPos:]...)...)
+				m.export.filenameCurPos++
+			}
+		}
+
+	case exportStepConfirm:
+		switch key {
+		case "enter", "y":
+			m.export.active = false
+			return m, m.executeExport()
+		case "backspace", "n":
+			m.export.step = exportStepFilename
+		}
+	}
+
+	return m, nil
+}
+
+func (m *model) updateExportFilenameExt() {
+	name := string(m.export.filenameBuf)
+	// Strip existing extension
+	for _, ext := range []string{".html", ".md", ".jsonl"} {
+		if strings.HasSuffix(name, ext) {
+			name = strings.TrimSuffix(name, ext)
+			break
+		}
+	}
+	// Add new extension
+	switch m.export.format {
+	case exportFormatHTML:
+		name += ".html"
+	case exportFormatMarkdown:
+		name += ".md"
+	case exportFormatJSONL:
+		name += ".jsonl"
+	}
+	m.export.filenameBuf = []rune(name)
+	m.export.filenameCurPos = len(m.export.filenameBuf)
+}
+
+func (m model) executeExport() tea.Cmd {
+	ex := m.export
+	var proj *TreeProject
+	if m.currentProj != nil {
+		p := *m.currentProj
+		proj = &p
+	}
+	return func() tea.Msg {
+		outDir := string(ex.pathBuf)
+		outFile := string(ex.filenameBuf)
+		outPath := filepath.Join(outDir, outFile)
+
+		switch ex.format {
+		case exportFormatHTML:
+			if ex.what == exportFullConversation && ex.convHasSubagents {
+				err := exportHTMLDir(ex.sourcePath, proj, outDir, outFile)
+				if err != nil {
+					return exportDoneMsg{"", err}
+				}
+				return exportDoneMsg{filepath.Join(outDir, strings.TrimSuffix(outFile, filepath.Ext(outFile))), nil}
+			}
+			entries, err := parseConversation(ex.sourcePath)
+			if err != nil {
+				return exportDoneMsg{"", err}
+			}
+			err = exportHTML(entries, outPath, ex.sourcePath)
+			return exportDoneMsg{outPath, err}
+
+		case exportFormatMarkdown:
+			entries, err := parseConversation(ex.sourcePath)
+			if err != nil {
+				return exportDoneMsg{"", err}
+			}
+			err = exportMarkdown(entries, outPath, ex.sourcePath)
+			return exportDoneMsg{outPath, err}
+
+		case exportFormatJSONL:
+			err := copyFile(ex.sourcePath, outPath)
+			return exportDoneMsg{outPath, err}
+		}
+
+		return exportDoneMsg{"", fmt.Errorf("unknown format")}
+	}
+}
+
+func (m model) renderExportOverlay() string {
+	overlayW := 64
+	if m.width-10 < overlayW {
+		overlayW = m.width - 10
+	}
+	if overlayW < 30 {
+		overlayW = 30
+	}
+	innerW := overlayW - 6 // padding + border
+
+	var lines []string
+	lines = append(lines, titleStyle.Render(" Export Conversation "))
+	lines = append(lines, "")
+
+	switch m.export.step {
+	case exportStepWhat:
+		lines = append(lines, " What to export:")
+		lines = append(lines, "")
+		options := []string{"Full conversation (with subagents)", "Main thread only"}
+		if m.export.convHasSubagents {
+			options = append(options, "Selected subagent only")
+		}
+		for i, opt := range options {
+			if i == m.export.whatCursor {
+				lines = append(lines, selectedStyle.Render(" > "+opt))
+			} else {
+				lines = append(lines, "   "+opt)
+			}
+		}
+	case exportStepFormat:
+		lines = append(lines, " Output format:")
+		lines = append(lines, "")
+		formats := []string{"HTML", "Markdown (.md)", "JSONL (raw copy)"}
+		for i, f := range formats {
+			if i == m.export.formatCursor {
+				lines = append(lines, selectedStyle.Render(" > "+f))
+			} else {
+				lines = append(lines, "   "+f)
+			}
+		}
+	case exportStepPath:
+		lines = append(lines, " Output directory:")
+		lines = append(lines, "")
+		pathStr := string(m.export.pathBuf)
+		if len(pathStr) > innerW-4 {
+			pathStr = "..." + pathStr[len(pathStr)-innerW+7:]
+		}
+		lines = append(lines, " "+pathStr+"\u2588")
+	case exportStepFilename:
+		lines = append(lines, " Filename:")
+		lines = append(lines, "")
+		fnStr := string(m.export.filenameBuf)
+		if len(fnStr) > innerW-4 {
+			fnStr = "..." + fnStr[len(fnStr)-innerW+7:]
+		}
+		lines = append(lines, " "+fnStr+"\u2588")
+	case exportStepConfirm:
+		lines = append(lines, " Confirm export:")
+		lines = append(lines, "")
+		whats := []string{"Full conversation", "Main thread only", "Selected subagent"}
+		fmts := []string{"HTML", "Markdown", "JSONL"}
+		lines = append(lines, fmt.Sprintf("   What:   %s", whats[m.export.what]))
+		lines = append(lines, fmt.Sprintf("   Format: %s", fmts[m.export.format]))
+		lines = append(lines, fmt.Sprintf("   Path:   %s", string(m.export.pathBuf)))
+		lines = append(lines, fmt.Sprintf("   File:   %s", string(m.export.filenameBuf)))
+		lines = append(lines, "")
+		lines = append(lines, loadedStyle.Render(" Press enter to export"))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, dimStyle.Render(" esc:cancel  enter:confirm  backspace:back"))
+
+	overlayBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#D97706")).
+		Padding(1, 2).
+		Width(overlayW).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayBox)
+}
+
+// ── Open in editor ──
+
+func openInEditor(path string) tea.Cmd {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		if runtime.GOOS == "darwin" {
+			editor = "open"
+		} else {
+			editor = "xdg-open"
+		}
+	}
+	c := exec.Command(editor, path)
+	return tea.ExecProcess(c, func(err error) tea.Msg {
+		return editorFinishedMsg{err}
+	})
 }
 
 // ── Dimensions ──
@@ -576,6 +1006,9 @@ func (m model) View() tea.View {
 			s = m.renderProjectDetail()
 		}
 	}
+	if m.export.active {
+		s = m.renderExportOverlay()
+	}
 	v := tea.NewView(s)
 	v.AltScreen = true
 	return v
@@ -586,7 +1019,7 @@ func (m model) View() tea.View {
 func (m model) renderProjectList() string {
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Width(m.width).Render(" Claude Code Explorer "))
+	b.WriteString(titleStyle.Width(m.width).Render(" ccview "))
 	b.WriteString("\n\n")
 
 	if m.tree == nil || len(m.tree.Projects) == 0 {
@@ -613,7 +1046,7 @@ func (m model) renderProjectList() string {
 
 		// Line 1: project path
 		name := proj.DisplayName
-		if len(name) > m.width-6 {
+		if lipgloss.Width(name) > m.width-6 {
 			name = "..." + name[len(name)-m.width+9:]
 		}
 
@@ -631,7 +1064,7 @@ func (m model) renderProjectList() string {
 		}
 		meta += fmt.Sprintf(" · %d msgs", proj.MsgCount)
 		if proj.LastActive != "" {
-			meta += " · " + formatDateShort(proj.LastActive)
+			meta += " · " + formatDateSmart(proj.LastActive)
 		}
 
 		// Badges
@@ -663,10 +1096,21 @@ func (m model) renderProjectList() string {
 	return b.String()
 }
 
-func formatDateShort(iso string) string {
+func formatDateSmart(iso string) string {
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
 		if t, err := time.Parse(layout, iso); err == nil {
-			return t.Local().Format("Jan 2")
+			t = t.Local()
+			now := time.Now()
+			if t.Year() == now.Year() && t.YearDay() == now.YearDay() {
+				return t.Format("15:04")
+			}
+			if now.Sub(t) < 7*24*time.Hour {
+				return t.Format("Mon 15:04")
+			}
+			if t.Year() == now.Year() {
+				return t.Format("Jan 2 15:04")
+			}
+			return t.Format("2006-01-02")
 		}
 	}
 	return ""
@@ -686,7 +1130,7 @@ func (m model) renderProjectDetail() string {
 
 	padL := lipgloss.NewStyle().Width(leftW).MaxWidth(leftW)
 	padR := lipgloss.NewStyle().MaxWidth(rightW)
-	sep := sepStyle.Render(" | ")
+	sep := sepStyle.Render(" \u2502 ")
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Width(m.width).Render(fmt.Sprintf(" %s ", m.currentProj.DisplayName)))
@@ -717,8 +1161,8 @@ func (m model) renderFullWidth() string {
 
 	var b strings.Builder
 	title := m.contentTitle
-	if len(title) > m.width-4 {
-		title = title[:m.width-7] + "..."
+	if lipgloss.Width(title) > m.width-4 {
+		title = ansi.Truncate(title, m.width-7, "...")
 	}
 	b.WriteString(titleStyle.Width(m.width).Render(fmt.Sprintf(" %s ", title)))
 	b.WriteString("\n")
@@ -782,18 +1226,22 @@ func (m model) buildSidebarLines(w, h int) []string {
 				lines = append(lines, dimStyle.Render(truncTo(text, w)))
 			}
 
+		case "header":
+			lines = append(lines, dimStyle.Bold(true).Render(" "+item.label))
+
 		case "conversation":
 			label := item.label
-			maxL := w - len(item.badge) - 4
+			badgeW := lipgloss.Width(item.badge)
+			maxL := w - badgeW - 4
 			if maxL < 8 {
 				maxL = 8
 			}
-			if len(label) > maxL {
-				label = label[:maxL-3] + "..."
+			if lipgloss.Width(label) > maxL {
+				label = ansi.Truncate(label, maxL-3, "...")
 			}
 			text := " " + label
 			if item.badge != "" {
-				gap := w - len(text) - len(item.badge) - 1
+				gap := w - lipgloss.Width(text) - badgeW - 1
 				if gap > 0 {
 					text += strings.Repeat(" ", gap) + item.badge
 				}
@@ -825,13 +1273,52 @@ func (m model) buildSidebarLines(w, h int) []string {
 }
 
 func truncTo(s string, w int) string {
-	if len(s) > w {
-		if w > 3 {
-			return s[:w-3] + "..."
-		}
-		return s[:w]
+	if lipgloss.Width(s) <= w {
+		return s
 	}
-	return s
+	if w > 3 {
+		return ansi.Truncate(s, w-3, "...")
+	}
+	return ansi.Truncate(s, w, "")
+}
+
+// wrapLine wraps a plain text line at width, with continuation lines indented.
+func wrapLine(text string, width, contIndent int) []string {
+	if len(text) <= width {
+		return []string{text}
+	}
+	var result []string
+	indent := strings.Repeat(" ", contIndent)
+	first := true
+	for len(text) > 0 {
+		w := width
+		if !first {
+			w = width - contIndent
+		}
+		if w <= 0 {
+			w = 10
+		}
+		if len(text) <= w {
+			if first {
+				result = append(result, text)
+			} else {
+				result = append(result, indent+text)
+			}
+			break
+		}
+		cut := strings.LastIndex(text[:w], " ")
+		if cut <= 0 {
+			cut = w
+		}
+		if first {
+			result = append(result, text[:cut])
+		} else {
+			result = append(result, indent+text[:cut])
+		}
+		text = strings.TrimLeft(text[cut:], " ")
+		first = false
+	}
+	return result
 }
 
 // ── Content pane ──
@@ -841,8 +1328,8 @@ func (m model) buildContentLines(w, h int) []string {
 
 	if m.contentTitle != "" {
 		title := m.contentTitle
-		if len(title) > w-2 {
-			title = title[:w-5] + "..."
+		if lipgloss.Width(title) > w-2 {
+			title = ansi.Truncate(title, w-5, "...")
 		}
 		if m.activePane == paneContent {
 			lines = append(lines, paneTitleActive.Render(title))
@@ -896,7 +1383,7 @@ func (m model) renderStatus() string {
 	if m.activePane == paneSidebar {
 		parts = append(parts,
 			statusHighlight.Render("sidebar")+statusStyle.Render("/viewer"),
-			"enter:open", "esc:back", "tab:viewer", "e:export", "q:quit",
+			"enter:open", "o:editor", "esc:back", "tab:viewer", "e:export", "q:quit",
 		)
 	} else {
 		parts = append(parts,
@@ -981,21 +1468,20 @@ func renderConversation(entries []Entry, width int) []string {
 					}
 					thinkLines := strings.Split(b.Thinking, "\n")
 					show := 3
+					prefix := "  [thinking] "
+					contIndent := 15
 					if len(thinkLines) > show {
 						for i := 0; i < show; i++ {
-							l := thinkLines[i]
-							if len(l) > contentWidth-14 {
-								l = l[:contentWidth-17] + "..."
+							for _, wl := range wrapLine(prefix+thinkLines[i], contentWidth, contIndent) {
+								lines = append(lines, thinkingStyle.Render(wl))
 							}
-							lines = append(lines, thinkingStyle.Render(fmt.Sprintf("  [thinking] %s", l)))
 						}
 						lines = append(lines, thinkingStyle.Render(fmt.Sprintf("  ... (%d more lines)", len(thinkLines)-show)))
 					} else {
 						for _, tl := range thinkLines {
-							if len(tl) > contentWidth-14 {
-								tl = tl[:contentWidth-17] + "..."
+							for _, wl := range wrapLine(prefix+tl, contentWidth, contIndent) {
+								lines = append(lines, thinkingStyle.Render(wl))
 							}
-							lines = append(lines, thinkingStyle.Render(fmt.Sprintf("  [thinking] %s", tl)))
 						}
 					}
 					lines = append(lines, "")
@@ -1011,7 +1497,10 @@ func renderConversation(entries []Entry, width int) []string {
 
 				case "tool_use":
 					summary := formatToolUse(b.Name, b.Input)
-					lines = append(lines, toolStyle.Render(fmt.Sprintf("  [tool] %s", summary)))
+					fullLine := fmt.Sprintf("  [tool] %s", summary)
+					for _, wl := range wrapLine(fullLine, contentWidth, 11) {
+						lines = append(lines, toolStyle.Render(wl))
+					}
 				}
 			}
 

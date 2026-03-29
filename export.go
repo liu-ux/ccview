@@ -6,6 +6,7 @@ import (
 	"html"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/yuin/goldmark"
@@ -262,4 +263,282 @@ func exportHTML(entries []Entry, outPath, sourcePath string) error {
 	}
 	defer f.Close()
 	return exportHTMLTo(entries, f, sourcePath)
+}
+
+// exportMarkdown writes a rendered conversation to a markdown file.
+func exportMarkdown(entries []Entry, outPath, sourcePath string) error {
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "# Claude Code Conversation\n\nSource: `%s`\n\n---\n\n", sourcePath)
+
+	for _, entry := range entries {
+		switch entry.Type {
+		case "user":
+			if entry.Parsed == nil {
+				continue
+			}
+			blocks := getContentBlocks(entry.Parsed)
+			isToolResult := false
+			for _, b := range blocks {
+				if b.Type == "tool_result" {
+					isToolResult = true
+					break
+				}
+			}
+			if isToolResult {
+				fmt.Fprint(f, "*[result] returned*\n\n")
+				continue
+			}
+			ts := formatTimestampFull(entry.Timestamp)
+			fmt.Fprintf(f, "## User (%s)\n\n", ts)
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					fmt.Fprintf(f, "%s\n\n", b.Text)
+				}
+			}
+
+		case "assistant":
+			if entry.Parsed == nil {
+				continue
+			}
+			blocks := getContentBlocks(entry.Parsed)
+			ts := formatTimestampFull(entry.Timestamp)
+			label := "Assistant"
+			if entry.Parsed.Model != "" {
+				label = fmt.Sprintf("Assistant (%s)", entry.Parsed.Model)
+			}
+			fmt.Fprintf(f, "## %s (%s)\n\n", label, ts)
+			for _, b := range blocks {
+				switch b.Type {
+				case "thinking":
+					if b.Thinking != "" {
+						fmt.Fprintf(f, "<details><summary>Thinking...</summary>\n\n%s\n\n</details>\n\n", b.Thinking)
+					}
+				case "text":
+					if b.Text != "" {
+						fmt.Fprintf(f, "%s\n\n", b.Text)
+					}
+				case "tool_use":
+					summary := formatToolUse(b.Name, b.Input)
+					fmt.Fprintf(f, "> **[tool]** %s\n\n", summary)
+				}
+			}
+			if entry.Parsed.Usage != nil {
+				u := entry.Parsed.Usage
+				fmt.Fprintf(f, "*tokens: in=%d out=%d*\n\n", u.InputTokens, u.OutputTokens)
+			}
+
+		case "system":
+			if entry.Subtype == "local_command" {
+				cmd := extractCommandName(entry.Content)
+				fmt.Fprintf(f, "*[system] %s*\n\n", cmd)
+			}
+		}
+	}
+	fmt.Fprint(f, "---\n\n*End of conversation*\n")
+	return nil
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0644)
+}
+
+// exportHTMLDir exports a full conversation with subagents as an HTML directory.
+func exportHTMLDir(convPath string, proj *TreeProject, outDir, indexName string) error {
+	// Find the conversation
+	var conv *TreeConversation
+	if proj != nil {
+		for i := range proj.Conversations {
+			if proj.Conversations[i].Path == convPath {
+				conv = &proj.Conversations[i]
+				break
+			}
+		}
+	}
+
+	if conv == nil || len(conv.SubAgents) == 0 {
+		// No subagents, just export single file
+		entries, err := parseConversation(convPath)
+		if err != nil {
+			return err
+		}
+		return exportHTML(entries, filepath.Join(outDir, indexName), convPath)
+	}
+
+	// Create export directory
+	dirName := strings.TrimSuffix(indexName, filepath.Ext(indexName))
+	exportDir := filepath.Join(outDir, dirName)
+	if err := os.MkdirAll(exportDir, 0755); err != nil {
+		return err
+	}
+
+	// Build nav HTML for subagent links
+	var navBuf strings.Builder
+	navBuf.WriteString(`<div class="nav-sidebar"><h3>Sub-agents</h3><ul>`)
+	for _, sa := range conv.SubAgents {
+		at := sa.AgentType
+		if at == "" {
+			at = "agent"
+		}
+		desc := sa.Description
+		if desc == "" {
+			desc = sa.Name
+		}
+		saFile := fmt.Sprintf("subagent-%s-%s.html", at, sa.Name[:min(8, len(sa.Name))])
+		navBuf.WriteString(fmt.Sprintf(`<li><a href="%s">%s: %s</a></li>`,
+			html.EscapeString(saFile), html.EscapeString(at), html.EscapeString(desc)))
+	}
+	navBuf.WriteString(`</ul></div>`)
+	navHTML := navBuf.String()
+
+	// Export main conversation as index.html with nav
+	entries, err := parseConversation(convPath)
+	if err != nil {
+		return err
+	}
+	indexPath := filepath.Join(exportDir, "index.html")
+	indexF, err := os.Create(indexPath)
+	if err != nil {
+		return err
+	}
+	defer indexF.Close()
+	exportHTMLWithNav(entries, indexF, convPath, navHTML)
+
+	// Export each subagent
+	for _, sa := range conv.SubAgents {
+		at := sa.AgentType
+		if at == "" {
+			at = "agent"
+		}
+		saFile := fmt.Sprintf("subagent-%s-%s.html", at, sa.Name[:min(8, len(sa.Name))])
+		saEntries, err := parseConversation(sa.Path)
+		if err != nil {
+			continue
+		}
+		saPath := filepath.Join(exportDir, saFile)
+		saF, err := os.Create(saPath)
+		if err != nil {
+			continue
+		}
+		backNav := `<div class="nav-sidebar"><a href="index.html">&larr; Back to main conversation</a></div>`
+		exportHTMLWithNav(saEntries, saF, sa.Path, backNav)
+		saF.Close()
+	}
+
+	return nil
+}
+
+const navCSS = `
+.nav-sidebar {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+}
+.nav-sidebar h3 { color: #D97706; margin: 0 0 10px 0; font-size: 0.9em; }
+.nav-sidebar ul { list-style: none; padding: 0; margin: 0; }
+.nav-sidebar li { margin: 4px 0; }
+.nav-sidebar a { color: #58a6ff; text-decoration: none; font-size: 0.85em; }
+.nav-sidebar a:hover { text-decoration: underline; }
+`
+
+// exportHTMLWithNav writes HTML export with navigation sidebar.
+func exportHTMLWithNav(entries []Entry, w io.Writer, sourcePath, navHTML string) error {
+	headerWithNav := strings.Replace(exportHTMLHeader, "</style>", navCSS+"</style>", 1)
+	fmt.Fprintf(w, headerWithNav, html.EscapeString(sourcePath))
+	fmt.Fprint(w, navHTML)
+
+	for _, entry := range entries {
+		switch entry.Type {
+		case "user":
+			if entry.Parsed == nil {
+				continue
+			}
+			blocks := getContentBlocks(entry.Parsed)
+			isToolResult := false
+			for _, b := range blocks {
+				if b.Type == "tool_result" {
+					isToolResult = true
+					break
+				}
+			}
+			if isToolResult {
+				fmt.Fprint(w, `<div class="tool-result">[result] returned</div>`)
+				continue
+			}
+			ts := formatTimestampFull(entry.Timestamp)
+			fmt.Fprint(w, `<div class="message user">`)
+			fmt.Fprintf(w, `<div class="role-label"><span>User</span><span class="ts">%s</span></div>`, html.EscapeString(ts))
+			fmt.Fprint(w, `<div class="content">`)
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					fmt.Fprint(w, markdownToHTML(b.Text))
+				}
+			}
+			fmt.Fprint(w, `</div></div>`)
+
+		case "assistant":
+			if entry.Parsed == nil {
+				continue
+			}
+			blocks := getContentBlocks(entry.Parsed)
+			modelName := entry.Parsed.Model
+			ts := formatTimestampFull(entry.Timestamp)
+			fmt.Fprint(w, `<div class="message assistant">`)
+			label := "Assistant"
+			if modelName != "" {
+				label = fmt.Sprintf("Assistant (%s)", modelName)
+			}
+			fmt.Fprintf(w, `<div class="role-label"><span>%s</span><span class="ts">%s</span></div>`,
+				html.EscapeString(label), html.EscapeString(ts))
+			fmt.Fprint(w, `<div class="content">`)
+			for _, b := range blocks {
+				switch b.Type {
+				case "thinking":
+					if b.Thinking != "" {
+						fmt.Fprintf(w, `<details class="thinking"><summary>Thinking...</summary><div>%s</div></details>`,
+							html.EscapeString(b.Thinking))
+					}
+				case "text":
+					if b.Text != "" {
+						fmt.Fprint(w, markdownToHTML(b.Text))
+					}
+				case "tool_use":
+					summary := formatToolUse(b.Name, b.Input)
+					fmt.Fprintf(w, `<div class="tool-use">[tool] %s</div>`, html.EscapeString(summary))
+				}
+			}
+			fmt.Fprint(w, `</div>`)
+			if entry.Parsed.Usage != nil {
+				u := entry.Parsed.Usage
+				fmt.Fprintf(w, `<div class="tokens">tokens: in=%d out=%d</div>`, u.InputTokens, u.OutputTokens)
+			}
+			fmt.Fprint(w, `</div>`)
+
+		case "system":
+			if entry.Subtype == "local_command" {
+				cmd := entry.Content
+				if idx := strings.Index(cmd, "<command-name>"); idx >= 0 {
+					start := idx + len("<command-name>")
+					if end := strings.Index(cmd[start:], "</command-name>"); end >= 0 {
+						cmd = cmd[start : start+end]
+					}
+				}
+				fmt.Fprintf(w, `<div class="system-msg">[system] %s</div>`, html.EscapeString(cmd))
+			}
+		}
+	}
+
+	fmt.Fprint(w, "\n</body>\n</html>\n")
+	return nil
 }

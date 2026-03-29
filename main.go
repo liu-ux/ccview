@@ -33,7 +33,7 @@ func main() {
 	if *exportPath != "" {
 		src := *filePath
 		if src == "" {
-			fmt.Fprintln(os.Stderr, "Usage: claude-log --export output.html --file conversation.jsonl")
+			fmt.Fprintln(os.Stderr, "Usage: ccview --export output.html --file conversation.jsonl")
 			os.Exit(1)
 		}
 		entries, err := parseConversation(src)

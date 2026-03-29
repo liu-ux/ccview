@@ -18,7 +18,7 @@ func startServer(port int) error {
 	mux.HandleFunc("/api/export", serveExport)
 
 	addr := fmt.Sprintf(":%d", port)
-	fmt.Printf("\n  Claude Log Viewer\n  http://localhost%s\n\n", addr)
+	fmt.Printf("\n  ccview\n  http://localhost%s\n\n", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -171,7 +171,7 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 const indexHTML = `<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Claude Log Viewer</title>
+<title>ccview</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js"></script>
 <style>
@@ -274,7 +274,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <!-- Screen 1: Project List -->
 <div class="screen active" id="screen-projects">
   <div class="topbar">
-    <h1><span class="logo">C</span> Claude Log Viewer</h1>
+    <h1><span class="logo">C</span> ccview</h1>
     <span class="stats" id="global-stats"></span>
   </div>
   <div class="project-list" id="project-list">
@@ -285,7 +285,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 <!-- Screen 2: Project Detail -->
 <div class="screen" id="screen-detail">
   <div class="topbar">
-    <h1><span class="logo">C</span> Claude Log Viewer</h1>
+    <h1><span class="logo">C</span> ccview</h1>
   </div>
   <div class="detail-layout">
     <aside class="sidebar">
