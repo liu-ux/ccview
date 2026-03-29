@@ -1,4 +1,4 @@
-module ccview
+module github.com/shivamstaq/ccview
 
 go 1.26.1
 

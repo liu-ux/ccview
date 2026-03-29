@@ -8,26 +8,56 @@ Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea), [Lip Gloss]
 
 ## Install
 
-### From source (recommended)
+### Download binary (easiest)
 
-Requires [Go 1.23+](https://go.dev/dl/).
+Download the latest release for your platform from [GitHub Releases](https://github.com/shivamstaq/ccview/releases/latest).
+
+**Linux**
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ccview.git
-cd ccview
-go build -o ccview .
+curl -Lo ccview.tar.gz https://github.com/shivamstaq/ccview/releases/latest/download/ccview_$(curl -s https://api.github.com/repos/shivamstaq/ccview/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')_linux_amd64.tar.gz
+tar xzf ccview.tar.gz
+sudo mv ccview /usr/local/bin/
 ```
 
-Optionally move the binary to your PATH:
+**macOS**
 
 ```bash
+# Apple Silicon (M1/M2/M3/M4)
+curl -Lo ccview.tar.gz https://github.com/shivamstaq/ccview/releases/latest/download/ccview_$(curl -s https://api.github.com/repos/shivamstaq/ccview/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')_darwin_arm64.tar.gz
+tar xzf ccview.tar.gz
 sudo mv ccview /usr/local/bin/
+
+# Intel
+curl -Lo ccview.tar.gz https://github.com/shivamstaq/ccview/releases/latest/download/ccview_$(curl -s https://api.github.com/repos/shivamstaq/ccview/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')_darwin_amd64.tar.gz
+tar xzf ccview.tar.gz
+sudo mv ccview /usr/local/bin/
+```
+
+**Windows (PowerShell)**
+
+```powershell
+# Download the latest .zip from https://github.com/shivamstaq/ccview/releases/latest
+# Extract and add ccview.exe to your PATH
+Invoke-WebRequest -Uri "https://github.com/shivamstaq/ccview/releases/latest" -OutFile ccview.zip
+Expand-Archive ccview.zip -DestinationPath "$env:LOCALAPPDATA\ccview"
+# Add $env:LOCALAPPDATA\ccview to your PATH
 ```
 
 ### Via `go install`
 
+Requires [Go 1.23+](https://go.dev/dl/). Works on all platforms.
+
 ```bash
-go install github.com/YOUR_USERNAME/ccview@latest
+go install github.com/shivamstaq/ccview@latest
+```
+
+### From source
+
+```bash
+git clone https://github.com/shivamstaq/ccview.git
+cd ccview
+go build -o ccview .
 ```
 
 ## Quick Start
