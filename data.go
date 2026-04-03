@@ -41,6 +41,7 @@ type TreeProject struct {
 	LastActive    string             `json:"lastActive"`
 	ConvCount     int                `json:"convCount"`
 	MsgCount      int                `json:"msgCount"`
+	Source        string             `json:"source,omitempty"` // "claude" or "opencode"
 }
 
 type TreeConversation struct {
@@ -57,6 +58,7 @@ type TreeConversation struct {
 	SubAgents     []TreeSubAgent `json:"subAgents,omitempty"`
 	FileEditCount int            `json:"fileEditCount,omitempty"`
 	ToolResults   int            `json:"toolResults,omitempty"`
+	Source        string         `json:"source,omitempty"` // "claude" or "opencode"
 }
 
 type TreeSubAgent struct {

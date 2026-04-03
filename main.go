@@ -49,8 +49,23 @@ func main() {
 		return
 	}
 
+	// Discover available providers
+	var providers []Provider
+	claude := &ClaudeProvider{}
+	if claude.Available() {
+		providers = append(providers, claude)
+	}
+	opencode := NewOpenCodeProvider()
+	if opencode.Available() {
+		providers = append(providers, opencode)
+	}
+	if len(providers) == 0 && *filePath == "" {
+		fmt.Fprintln(os.Stderr, "No session data found. Checked ~/.claude/ and ~/.local/share/opencode/")
+		os.Exit(1)
+	}
+
 	// Interactive TUI mode
-	p := tea.NewProgram(newModel(*filePath))
+	p := tea.NewProgram(newModel(*filePath, providers))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
