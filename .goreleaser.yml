@@ -27,14 +27,27 @@ checksum:
   name_template: "checksums.txt"
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
-      - "^ci:"
+  disable: true
 
 release:
+  header: |
+    ## What's New
+
+    ### OpenCode Support
+    - Added OpenCode as a second data provider, reading sessions from `~/.local/share/opencode/opencode.db` via pure-Go SQLite (no CGO)
+    - New `Provider` interface decouples data loading from UI — Claude Code and OpenCode implement it independently
+    - Tabbed UI (`1`/`2` to switch) when both providers are available; tabs auto-hide with only one
+
+    ### Search
+    - **Content search** — press `/` in the viewer for live debounced search with highlighted matches and `n`/`N` navigation
+    - **Session search overlay** — press `/` from the project list (global) or sidebar (project-scoped) to search across all sessions
+
+    ### Mouse Support
+    - Pane-scoped mouse selection — click to focus, drag-select text in the content pane, auto-copies to clipboard
+    - Scroll wheel works per-pane
+
+    ### Bug Fixes
+    - Fixed Windows installer path handling
   github:
     owner: shivamstaq
     name: ccview
