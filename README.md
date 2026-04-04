@@ -1,6 +1,6 @@
 # ccview
 
-A terminal-based explorer and renderer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) conversation histories. Browse projects, view conversations with markdown rendering, inspect sub-agents, and export to HTML/Markdown/JSONL.
+A terminal-based explorer and renderer for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenCode](https://github.com/opencode-ai/opencode) conversation histories. Browse projects, view conversations with markdown rendering, inspect sub-agents, search across sessions, and export to HTML/Markdown/JSONL.
 
 Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea), [Lip Gloss](https://github.com/charmbracelet/lipgloss), and [Glamour](https://github.com/charmbracelet/glamour).
 
@@ -85,10 +85,14 @@ ccview
 
 Split-pane interactive explorer. Left pane shows the project tree with conversations, plans, and memory files. Right pane renders conversation content with syntax-highlighted markdown.
 
+- **Multi-provider support** - Claude Code (`~/.claude/`) and OpenCode (`~/.local/share/opencode/opencode.db`) side by side. Tabbed UI when both are available; tabs hidden with only one provider.
 - Conversations sorted newest-first with smart timestamps
 - Sub-agents collapsed by default, expand on selection
 - Global plans shown in sidebar
 - Tool calls wrap cleanly with aligned continuation lines
+- **Mouse selection** - Click to focus panes, drag-select text within the content pane, auto-copies to clipboard. Scroll wheel works per-pane.
+- **Content search** - Press `/` in the viewer for live debounced search with match highlighting and `n`/`N` navigation between matches.
+- **Session search** - Press `/` from the project list or sidebar to open a search overlay. Toggle between global and project-scoped results with `tab`, navigate with `j`/`k`, open with `enter`.
 - Press `o` to open any file in your `$EDITOR`
 - Press `e` for a guided export wizard (format, path, filename)
 
@@ -127,10 +131,18 @@ For full conversations with sub-agents, HTML export creates a directory with `in
 | `l` / `Right` | Switch to viewer |
 | `h` / `Left` / `Esc` | Back to project list |
 | `Tab` | Switch to viewer pane |
+| `/` | Open session search (project-scoped) |
 | `e` | Export wizard |
 | `o` | Open in `$EDITOR` |
 | `g` / `G` | Jump to top/bottom |
 | `q` | Quit |
+
+### Project List
+
+| Key | Action |
+|-----|--------|
+| `1` / `2` | Switch provider tab |
+| `/` | Open session search (global) |
 
 ### Viewer
 
@@ -140,14 +152,28 @@ For full conversations with sub-agents, HTML export creates a directory with `in
 | `Space` / `f` | Page down |
 | `b` | Page up |
 | `g` / `G` | Jump to top/bottom |
+| `/` | Search content |
+| `n` / `N` | Next / previous match |
+| `Esc` | Clear search |
 | `Tab` / `h` | Switch to sidebar |
 | `e` | Export wizard |
 | `o` | Open in `$EDITOR` |
 | `q` | Quit |
 
+### Session Search Overlay
+
+| Key | Action |
+|-----|--------|
+| `tab` | Toggle global / project scope |
+| `j` / `k` | Navigate results |
+| `Enter` | Open selected session |
+| `Esc` | Close overlay |
+
 ## What it reads
 
-ccview reads from `~/.claude/` and organizes data as:
+ccview reads from multiple sources:
+
+#### Claude Code (`~/.claude/`)
 
 | Source | Description |
 |--------|-------------|
@@ -158,6 +184,14 @@ ccview reads from `~/.claude/` and organizes data as:
 | `*/memory/*.md` | Per-project memory files |
 | `*/CLAUDE.md` | Project-level instructions |
 | `~/.claude/plans/*.md` | Plan documents |
+
+#### OpenCode (`~/.local/share/opencode/`)
+
+| Source | Description |
+|--------|-------------|
+| `opencode.db` | SQLite database with sessions, messages, and parts |
+| Sessions | Grouped by project (worktree path) |
+| Message parts | Text, tool calls, reasoning, patches, and file references |
 
 ### Message types rendered
 
@@ -170,12 +204,15 @@ ccview reads from `~/.claude/` and organizes data as:
 ## Architecture
 
 ```
-main.go       CLI entry point, flag parsing
-data.go       Tree types, project scanning, filesystem loading
-parse.go      JSONL parsing, glamour rendering, formatting helpers
-ui.go         Bubble Tea TUI with split-pane layout
-server.go     HTTP server with embedded SPA
-export.go     HTML/Markdown/JSONL export
+main.go              CLI entry point, flag parsing
+provider.go          Provider interface (abstracts data sources)
+provider_claude.go   Claude Code provider (filesystem/JSONL)
+provider_opencode.go OpenCode provider (SQLite)
+data.go              Tree types, project scanning, filesystem loading
+parse.go             JSONL parsing, glamour rendering, formatting helpers
+ui.go                Bubble Tea TUI with split-pane layout, search
+server.go            HTTP server with embedded SPA
+export.go            HTML/Markdown/JSONL export
 ```
 
 ## Dependencies
@@ -185,6 +222,7 @@ export.go     HTML/Markdown/JSONL export
 - [github.com/charmbracelet/glamour](https://github.com/charmbracelet/glamour) - Terminal markdown rendering
 - [github.com/charmbracelet/x/ansi](https://github.com/charmbracelet/x) - ANSI-aware string handling
 - [github.com/yuin/goldmark](https://github.com/yuin/goldmark) - HTML markdown rendering
+- [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) - Pure Go SQLite (no CGO)
 
 ## License
 
