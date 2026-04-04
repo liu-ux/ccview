@@ -39,13 +39,35 @@ type sidebarItem struct {
 	badge string
 }
 
+type searchScope int
+
+const (
+	searchScopeProject searchScope = iota
+	searchScopeGlobal
+)
+
+type sessionSearchState struct {
+	active    bool
+	scope     searchScope
+	input     []rune
+	results   []SearchResult
+	cursor    int
+	offset    int
+	gen       int // debounce generation — only the latest tick fires search
+}
+
 // ── Model ──
 
 type model struct {
 	state         viewState
 	width, height int
 
-	// Project list screen
+	// Providers
+	providers     []Provider
+	providerTrees []*TreeData // one tree per provider
+	providerTab   int         // active tab index in project list
+
+	// Project list screen (current tab's tree)
 	tree       *TreeData
 	projCursor int
 	projOffset int
@@ -54,6 +76,7 @@ type model struct {
 	activePane       pane
 	projIndex        int          // index into tree.Projects
 	currentProj      *TreeProject // pointer to selected project
+	currentProvider  Provider     // provider for current project
 	sidebar          []sidebarItem
 	sidebarCursor    int
 	sidebarOffset    int
@@ -72,6 +95,24 @@ type model struct {
 
 	// Export overlay
 	export exportState
+
+	// Mouse selection
+	mouseSelecting    bool
+	mouseSelStart     [2]int // [row, col] in screen coordinates
+	mouseSelEnd       [2]int
+	mouseHasSelection bool
+
+	// Content search
+	contentSearchActive bool
+	contentSearchInput  []rune
+	contentSearchPos    int
+	contentMatches      []int  // line indices with matches
+	contentMatchIdx     int    // current match index
+	contentSearchQuery  string // for highlighting
+	contentSearchGen    int    // debounce generation
+
+	// Session search overlay
+	sessionSearch       sessionSearchState
 }
 
 // ── Export overlay types ──
@@ -120,10 +161,6 @@ type exportState struct {
 
 // ── Messages ──
 
-type treeLoadedMsg struct {
-	tree *TreeData
-	err  error
-}
 type contentLoadedMsg struct {
 	lines []string
 	title string
@@ -140,6 +177,11 @@ type exportDoneMsg struct {
 
 type editorFinishedMsg struct {
 	err error
+}
+
+type searchDebounceMsg struct {
+	gen  int
+	kind string // "content" or "session"
 }
 
 // ── Styles ──
@@ -223,25 +265,49 @@ var (
 
 // ── Init ──
 
-func newModel(directFile string) model {
-	return model{state: viewLoading, directFile: directFile}
+func newModel(directFile string, providers []Provider) model {
+	return model{
+		state:      viewLoading,
+		directFile: directFile,
+		providers:  providers,
+	}
 }
 
 func (m model) Init() tea.Cmd {
 	if m.directFile != "" {
-		return loadConvCmd(m.directFile, m.directFile, 120)
+		return loadConvCmd(m.directFile, m.directFile, 120, nil)
 	}
-	return loadTreeCmd
+	return m.loadAllTreesCmd()
 }
 
-func loadTreeCmd() tea.Msg {
-	tree, err := loadTree()
-	return treeLoadedMsg{tree, err}
+// treeLoadedMsg is now per-provider.
+type providerTreeLoadedMsg struct {
+	index int
+	tree  *TreeData
+	err   error
 }
 
-func loadConvCmd(path, title string, width int) tea.Cmd {
+func (m model) loadAllTreesCmd() tea.Cmd {
+	cmds := make([]tea.Cmd, len(m.providers))
+	for i, prov := range m.providers {
+		i, prov := i, prov
+		cmds[i] = func() tea.Msg {
+			tree, err := prov.LoadTree()
+			return providerTreeLoadedMsg{i, tree, err}
+		}
+	}
+	return tea.Batch(cmds...)
+}
+
+func loadConvCmd(path, title string, width int, provider Provider) tea.Cmd {
 	return func() tea.Msg {
-		entries, err := parseConversation(path)
+		var entries []Entry
+		var err error
+		if provider != nil {
+			entries, err = provider.LoadConversation(path)
+		} else {
+			entries, err = parseConversation(path)
+		}
 		if err != nil {
 			return contentLoadedMsg{nil, title, path, "conversation", err}
 		}
@@ -356,19 +422,53 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.state == viewProjectDetail && m.contentPath != "" && m.contentKind == "conversation" && oldW != msg.Width {
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider)
 		}
 		return m, nil
 
-	case treeLoadedMsg:
-		if msg.err != nil {
-			m.err = msg.err
+	case providerTreeLoadedMsg:
+		// Initialize providerTrees slice if needed
+		if m.providerTrees == nil {
+			m.providerTrees = make([]*TreeData, len(m.providers))
+		}
+		if msg.index >= 0 && msg.index < len(m.providerTrees) {
+			if msg.err == nil && msg.tree != nil {
+				m.providerTrees[msg.index] = msg.tree
+			} else {
+				// Mark errored providers with empty tree so we know they've responded
+				m.providerTrees[msg.index] = &TreeData{}
+			}
+		}
+		// Count how many have responded
+		loaded := 0
+		for _, t := range m.providerTrees {
+			if t != nil {
+				loaded++
+			}
+		}
+		if loaded < len(m.providers) {
+			return m, nil // still waiting
+		}
+		if m.directFile != "" {
 			return m, nil
 		}
-		m.tree = msg.tree
-		if m.directFile != "" {
-			// Direct file mode handled by contentLoadedMsg
-			return m, nil
+		// All loaded — set active tab to first provider with data
+		for i, t := range m.providerTrees {
+			if t != nil && len(t.Projects) > 0 {
+				m.providerTab = i
+				m.tree = t
+				break
+			}
+		}
+		if m.tree == nil {
+			// Use first non-nil tree even if empty
+			for i, t := range m.providerTrees {
+				if t != nil {
+					m.providerTab = i
+					m.tree = t
+					break
+				}
+			}
 		}
 		m.state = viewProjectList
 		return m, nil
@@ -385,6 +485,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.contentOffset = 0
 		if m.directFile != "" {
 			m.state = viewProjectDetail
+		}
+		return m, nil
+
+	case searchDebounceMsg:
+		if msg.kind == "content" && msg.gen == m.contentSearchGen {
+			m.contentSearchQuery = string(m.contentSearchInput)
+			m.computeContentMatches()
+			if len(m.contentMatches) > 0 {
+				m.contentMatchIdx = 0
+				m.scrollToMatch()
+			}
+		}
+		if msg.kind == "session" && msg.gen == m.sessionSearch.gen {
+			m.computeSessionSearchResults()
 		}
 		return m, nil
 
@@ -407,11 +521,39 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case searchNavigateMsg:
+		// Switch to the correct provider tab
+		if msg.providerIdx >= 0 && msg.providerIdx < len(m.providerTrees) {
+			m.switchProviderTab(msg.providerIdx)
+		}
+		// Open the project
+		m.openProject(msg.projIdx)
+		// Load the conversation
+		_, rw := m.paneWidths()
+		return m, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider)
+
+	case tea.MouseClickMsg:
+		return m.handleMouseClick(msg)
+	case tea.MouseMotionMsg:
+		return m.handleMouseMotion(msg)
+	case tea.MouseReleaseMsg:
+		return m.handleMouseRelease(msg)
+	case tea.MouseWheelMsg:
+		return m.handleMouseWheel(msg)
+
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		// Export overlay intercepts all keys when active
+		// Clear selection on any keypress
+		if m.mouseHasSelection {
+			m.mouseHasSelection = false
+			m.mouseSelecting = false
+		}
+		// Overlays intercept all keys when active
+		if m.sessionSearch.active {
+			return m.updateSessionSearch(msg)
+		}
 		if m.export.active {
 			return m.updateExportOverlay(msg)
 		}
@@ -431,17 +573,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if m.tree == nil || len(m.tree.Projects) == 0 {
-		if msg.String() == "q" {
-			return m, tea.Quit
+func (m *model) switchProviderTab(idx int) {
+	if idx < 0 || idx >= len(m.providerTrees) || m.providerTrees[idx] == nil {
+		return
+	}
+	m.providerTab = idx
+	m.tree = m.providerTrees[idx]
+	m.projCursor = 0
+	m.projOffset = 0
+}
+
+func (m model) hasMultipleTabs() bool {
+	count := 0
+	for _, t := range m.providerTrees {
+		if t != nil && len(t.Projects) > 0 {
+			count++
 		}
+	}
+	return count > 1
+}
+
+func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q":
+		return m, tea.Quit
+	case "1":
+		if m.hasMultipleTabs() {
+			m.switchProviderTab(0)
+		}
+	case "2":
+		if len(m.providerTrees) > 1 && m.hasMultipleTabs() {
+			m.switchProviderTab(1)
+		}
+	case "tab":
+		if m.hasMultipleTabs() {
+			next := (m.providerTab + 1) % len(m.providerTrees)
+			// Skip nil trees
+			for m.providerTrees[next] == nil || len(m.providerTrees[next].Projects) == 0 {
+				next = (next + 1) % len(m.providerTrees)
+				if next == m.providerTab {
+					break
+				}
+			}
+			m.switchProviderTab(next)
+		}
+	}
+
+	if m.tree == nil || len(m.tree.Projects) == 0 {
 		return m, nil
 	}
 
 	switch msg.String() {
-	case "q":
-		return m, tea.Quit
 	case "up", "k":
 		if m.projCursor > 0 {
 			m.projCursor--
@@ -457,10 +639,17 @@ func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "enter", "l", "right":
 		m.openProject(m.projCursor)
 		return m, nil
+	case "/":
+		m.openSessionSearch(searchScopeGlobal)
+		return m, nil
 	}
 
-	// Keep cursor visible
-	viewH := m.height - 4
+	// Keep cursor visible — account for tab bar height
+	tabBarH := 0
+	if m.hasMultipleTabs() {
+		tabBarH = 2
+	}
+	viewH := m.height - 4 - tabBarH
 	itemH := 3 // lines per project item
 	maxVisible := viewH / itemH
 	if maxVisible < 1 {
@@ -482,6 +671,8 @@ func (m *model) openProject(idx int) {
 	}
 	m.projIndex = idx
 	m.currentProj = &m.tree.Projects[idx]
+	// Set the provider for this project based on its source
+	m.currentProvider = m.providers[m.providerTab]
 	m.expandedConvPath = ""
 	m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
 	m.sidebarCursor = 0
@@ -547,11 +738,11 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider)
 			case "subagent":
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider)
 			case "file":
 				m.contentTitle = item.label
 				m.contentLines = nil
@@ -573,6 +764,9 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, openInEditor(item.path)
 			}
 		}
+	case "/":
+		m.openSessionSearch(searchScopeProject)
+		return m, nil
 	}
 
 	// Keep cursor visible
@@ -591,6 +785,11 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// Content search mode intercepts keys
+	if m.contentSearchActive {
+		return m.updateContentSearch(msg)
+	}
+
 	_, paneH := m.contentPaneDims()
 	contentH := paneH - 2
 	maxOff := len(m.contentLines) - contentH
@@ -623,11 +822,44 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.contentOffset = 0
 	case "end", "G":
 		m.contentOffset = maxOff
-	case "esc", "h", "left", "tab":
+	case "esc":
+		if m.contentSearchQuery != "" {
+			// Clear search highlights
+			m.contentSearchQuery = ""
+			m.contentMatches = nil
+			return m, nil
+		}
 		if m.directFile != "" {
 			return m, tea.Quit
 		}
 		m.activePane = paneSidebar
+	case "h", "left", "tab":
+		if m.directFile != "" {
+			return m, tea.Quit
+		}
+		m.activePane = paneSidebar
+	case "/":
+		if len(m.contentLines) > 0 {
+			m.contentSearchActive = true
+			m.contentSearchInput = nil
+			m.contentSearchPos = 0
+			return m, nil
+		}
+	case "n":
+		// Next match
+		if len(m.contentMatches) > 0 {
+			m.contentMatchIdx = (m.contentMatchIdx + 1) % len(m.contentMatches)
+			m.scrollToMatch()
+		}
+	case "N":
+		// Previous match
+		if len(m.contentMatches) > 0 {
+			m.contentMatchIdx--
+			if m.contentMatchIdx < 0 {
+				m.contentMatchIdx = len(m.contentMatches) - 1
+			}
+			m.scrollToMatch()
+		}
 	case "e":
 		if m.contentPath != "" && m.contentKind == "conversation" {
 			m.initExportOverlay(m.contentPath, m.contentTitle)
@@ -639,6 +871,572 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m model) contentSearchDebounceCmd() tea.Cmd {
+	gen := m.contentSearchGen
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		return searchDebounceMsg{gen: gen, kind: "content"}
+	})
+}
+
+func (m model) updateContentSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "esc":
+		m.contentSearchActive = false
+		return m, nil
+	case "enter":
+		m.contentSearchActive = false
+		// Immediate compute on enter (bypass debounce)
+		m.contentSearchQuery = string(m.contentSearchInput)
+		m.computeContentMatches()
+		if len(m.contentMatches) > 0 {
+			m.contentMatchIdx = 0
+			m.scrollToMatch()
+		}
+		return m, nil
+	case "backspace":
+		if len(m.contentSearchInput) > 0 {
+			m.contentSearchInput = m.contentSearchInput[:len(m.contentSearchInput)-1]
+			m.contentSearchGen++
+			return m, m.contentSearchDebounceCmd()
+		}
+		return m, nil
+	default:
+		r := []rune(key)
+		if len(r) == 1 && r[0] >= 32 {
+			m.contentSearchInput = append(m.contentSearchInput, r[0])
+			m.contentSearchGen++
+			return m, m.contentSearchDebounceCmd()
+		}
+		return m, nil
+	}
+}
+
+func (m *model) computeContentMatches() {
+	m.contentMatches = nil
+	if m.contentSearchQuery == "" {
+		return
+	}
+	q := strings.ToLower(m.contentSearchQuery)
+	for i, line := range m.contentLines {
+		plain := strings.ToLower(ansi.Strip(line))
+		if strings.Contains(plain, q) {
+			m.contentMatches = append(m.contentMatches, i)
+		}
+	}
+}
+
+func (m *model) scrollToMatch() {
+	if m.contentMatchIdx < 0 || m.contentMatchIdx >= len(m.contentMatches) {
+		return
+	}
+	targetLine := m.contentMatches[m.contentMatchIdx]
+	_, paneH := m.contentPaneDims()
+	contentH := paneH - 2
+	// Center the match in the viewport
+	m.contentOffset = targetLine - contentH/2
+	maxOff := len(m.contentLines) - contentH
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.contentOffset < 0 {
+		m.contentOffset = 0
+	}
+	if m.contentOffset > maxOff {
+		m.contentOffset = maxOff
+	}
+}
+
+// ── Session search ──
+
+func (m *model) openSessionSearch(scope searchScope) {
+	m.sessionSearch = sessionSearchState{
+		active: true,
+		scope:  scope,
+	}
+}
+
+func (m model) sessionSearchDebounceCmd() tea.Cmd {
+	gen := m.sessionSearch.gen
+	return tea.Tick(300*time.Millisecond, func(time.Time) tea.Msg {
+		return searchDebounceMsg{gen: gen, kind: "session"}
+	})
+}
+
+func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+
+	switch key {
+	case "esc":
+		m.sessionSearch.active = false
+		return m, nil
+	case "enter":
+		if len(m.sessionSearch.results) > 0 && m.sessionSearch.cursor < len(m.sessionSearch.results) {
+			result := m.sessionSearch.results[m.sessionSearch.cursor]
+			m.sessionSearch.active = false
+			return m, m.navigateToSearchResult(result)
+		}
+		return m, nil
+	case "tab":
+		// Toggle scope — immediate recompute since it's just re-filtering
+		if m.sessionSearch.scope == searchScopeProject {
+			m.sessionSearch.scope = searchScopeGlobal
+		} else {
+			m.sessionSearch.scope = searchScopeProject
+		}
+		m.sessionSearch.gen++
+		m.computeSessionSearchResults()
+		return m, nil
+	case "up", "k":
+		if m.sessionSearch.cursor > 0 {
+			m.sessionSearch.cursor--
+		}
+	case "down", "j":
+		if m.sessionSearch.cursor < len(m.sessionSearch.results)-1 {
+			m.sessionSearch.cursor++
+		}
+	case "backspace":
+		if len(m.sessionSearch.input) > 0 {
+			m.sessionSearch.input = m.sessionSearch.input[:len(m.sessionSearch.input)-1]
+			m.sessionSearch.cursor = 0
+			m.sessionSearch.offset = 0
+			m.sessionSearch.gen++
+			return m, m.sessionSearchDebounceCmd()
+		}
+		return m, nil
+	default:
+		r := []rune(key)
+		if len(r) == 1 && r[0] >= 32 {
+			m.sessionSearch.input = append(m.sessionSearch.input, r[0])
+			m.sessionSearch.cursor = 0
+			m.sessionSearch.offset = 0
+			m.sessionSearch.gen++
+			return m, m.sessionSearchDebounceCmd()
+		}
+		return m, nil
+	}
+
+	// Keep cursor visible
+	maxVisible := m.height/2 - 6
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+	if m.sessionSearch.cursor < m.sessionSearch.offset {
+		m.sessionSearch.offset = m.sessionSearch.cursor
+	}
+	if m.sessionSearch.cursor >= m.sessionSearch.offset+maxVisible {
+		m.sessionSearch.offset = m.sessionSearch.cursor - maxVisible + 1
+	}
+
+	return m, nil
+}
+
+func (m *model) computeSessionSearchResults() {
+	query := string(m.sessionSearch.input)
+	if query == "" {
+		m.sessionSearch.results = nil
+		return
+	}
+
+	var allResults []SearchResult
+	if m.sessionSearch.scope == searchScopeProject && m.currentProj != nil {
+		// Project scope: only search current provider's project
+		if m.currentProvider != nil {
+			results := m.currentProvider.SearchSessions(query, m.currentProj.DirName)
+			allResults = append(allResults, results...)
+		}
+	} else {
+		// Global scope: search all providers
+		for _, prov := range m.providers {
+			results := prov.SearchSessions(query, "")
+			allResults = append(allResults, results...)
+		}
+	}
+	sortSearchResults(allResults)
+
+	// Limit results
+	if len(allResults) > 50 {
+		allResults = allResults[:50]
+	}
+	m.sessionSearch.results = allResults
+}
+
+func (m model) navigateToSearchResult(result SearchResult) tea.Cmd {
+	// Find the provider and project that matches
+	for provIdx, prov := range m.providers {
+		// Match source: "claude" matches "Claude Code", "opencode" matches "OpenCode"
+		provKey := strings.ToLower(strings.ReplaceAll(prov.Name(), " ", ""))
+		if !strings.Contains(provKey, result.Source) && result.Source != provKey {
+			continue
+		}
+		tree := m.providerTrees[provIdx]
+		if tree == nil {
+			continue
+		}
+		for projIdx, proj := range tree.Projects {
+			for _, conv := range proj.Conversations {
+				if conv.Path == result.Path || conv.SessionID == result.Path {
+					// Found the project and conversation
+					return func() tea.Msg {
+						return searchNavigateMsg{
+							providerIdx: provIdx,
+							projIdx:     projIdx,
+							convPath:    result.Path,
+							convTitle:   result.Title,
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+type searchNavigateMsg struct {
+	providerIdx int
+	projIdx     int
+	convPath    string
+	convTitle   string
+}
+
+func (m model) renderSessionSearchOverlay() string {
+	overlayW := 70
+	if m.width-10 < overlayW {
+		overlayW = m.width - 10
+	}
+	if overlayW < 40 {
+		overlayW = 40
+	}
+	innerW := overlayW - 6
+
+	var lines []string
+	lines = append(lines, titleStyle.Render(" Search Sessions "))
+	lines = append(lines, "")
+
+	// Search input
+	query := string(m.sessionSearch.input)
+	scopeLabel := "global"
+	if m.sessionSearch.scope == searchScopeProject {
+		scopeLabel = "project"
+	}
+	inputLine := fmt.Sprintf(" /%s", query+"\u2588")
+	scopeBadge := dimStyle.Render(fmt.Sprintf("[%s]", scopeLabel))
+	gap := innerW - lipgloss.Width(inputLine) - lipgloss.Width(scopeBadge)
+	if gap < 1 {
+		gap = 1
+	}
+	lines = append(lines, inputLine+strings.Repeat(" ", gap)+scopeBadge)
+	lines = append(lines, faintStyle.Render(strings.Repeat("\u2500", innerW)))
+
+	// Results
+	maxVisible := m.height/2 - 8
+	if maxVisible < 3 {
+		maxVisible = 3
+	}
+	if len(m.sessionSearch.results) == 0 {
+		if len(query) > 0 {
+			lines = append(lines, dimStyle.Render(" No matches found"))
+		} else {
+			lines = append(lines, dimStyle.Render(" Type to search..."))
+		}
+	} else {
+		end := m.sessionSearch.offset + maxVisible
+		if end > len(m.sessionSearch.results) {
+			end = len(m.sessionSearch.results)
+		}
+		for i := m.sessionSearch.offset; i < end; i++ {
+			r := m.sessionSearch.results[i]
+			isCur := i == m.sessionSearch.cursor
+
+			// Source badge
+			srcBadge := "[CC]"
+			if strings.Contains(strings.ToLower(r.Source), "open") {
+				srcBadge = "[OC]"
+			}
+
+			title := r.Title
+			dateStr := formatDateSmart(r.ModTime)
+			rightPart := fmt.Sprintf(" %s %s", srcBadge, dateStr)
+			maxTitle := innerW - lipgloss.Width(rightPart) - 4
+			if maxTitle < 10 {
+				maxTitle = 10
+			}
+			if len(title) > maxTitle {
+				title = title[:maxTitle-3] + "..."
+			}
+
+			entryLine := fmt.Sprintf(" %s", title)
+			titleGap := innerW - lipgloss.Width(entryLine) - lipgloss.Width(rightPart)
+			if titleGap < 1 {
+				titleGap = 1
+			}
+			entryLine += strings.Repeat(" ", titleGap) + rightPart
+
+			if isCur {
+				lines = append(lines, selectedStyle.Render(truncTo(entryLine, innerW)))
+			} else {
+				lines = append(lines, truncTo(entryLine, innerW))
+			}
+
+			// Show project name on second line for current selection
+			if isCur && r.ProjectName != "" {
+				lines = append(lines, dimStyle.Render("   "+r.ProjectName))
+			}
+		}
+	}
+
+	lines = append(lines, "")
+	resultCount := len(m.sessionSearch.results)
+	hint := fmt.Sprintf(" %d results  enter:open  tab:scope  esc:close", resultCount)
+	lines = append(lines, dimStyle.Render(hint))
+
+	overlayBox := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("#D97706")).
+		Padding(1, 2).
+		Width(overlayW).
+		Render(strings.Join(lines, "\n"))
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, overlayBox)
+}
+
+// ── Mouse handling ──
+
+// contentPaneRect returns the screen rectangle of the content pane (x, y, w, h).
+func (m model) contentPaneRect() (int, int, int, int) {
+	if m.directFile != "" {
+		return 0, 1, m.width, m.height - 2
+	}
+	leftW, rightW := m.paneWidths()
+	x := leftW + 3 // left pane + separator " │ "
+	y := 1          // title bar
+	return x, y, rightW, m.height - 2
+}
+
+// sidebarPaneRect returns the screen rectangle of the sidebar pane.
+func (m model) sidebarPaneRect() (int, int, int, int) {
+	leftW, _ := m.paneWidths()
+	return 0, 1, leftW, m.height - 2
+}
+
+func (m model) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if m.export.active || m.state != viewProjectDetail {
+		return m, nil
+	}
+	if msg.Button != tea.MouseLeft {
+		return m, nil
+	}
+
+	cx, cy, cw, ch := m.contentPaneRect()
+
+	// Check if click is within content pane
+	if msg.X >= cx && msg.X < cx+cw && msg.Y >= cy && msg.Y < cy+ch {
+		m.activePane = paneContent
+		m.mouseSelecting = true
+		m.mouseHasSelection = false
+		m.mouseSelStart = [2]int{msg.Y, msg.X}
+		m.mouseSelEnd = m.mouseSelStart
+		return m, nil
+	}
+
+	// Check if click is within sidebar
+	if m.directFile == "" {
+		sx, sy, sw, sh := m.sidebarPaneRect()
+		if msg.X >= sx && msg.X < sx+sw && msg.Y >= sy && msg.Y < sy+sh {
+			m.activePane = paneSidebar
+			m.mouseSelecting = false
+			m.mouseHasSelection = false
+			return m, nil
+		}
+	}
+
+	return m, nil
+}
+
+func (m model) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd) {
+	if !m.mouseSelecting {
+		return m, nil
+	}
+	m.mouseSelEnd = [2]int{msg.Y, msg.X}
+	m.mouseHasSelection = true
+	return m, nil
+}
+
+func (m model) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
+	if !m.mouseSelecting {
+		return m, nil
+	}
+	m.mouseSelecting = false
+	m.mouseSelEnd = [2]int{msg.Y, msg.X}
+
+	if m.mouseSelStart == m.mouseSelEnd {
+		m.mouseHasSelection = false
+		return m, nil
+	}
+
+	m.mouseHasSelection = true
+
+	// Extract selected text from content pane
+	text := m.extractSelectedText()
+	if text != "" {
+		return m, copyToClipboard(text)
+	}
+	return m, nil
+}
+
+func (m model) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	if m.state != viewProjectDetail {
+		return m, nil
+	}
+
+	cx, cy, cw, ch := m.contentPaneRect()
+	inContent := msg.X >= cx && msg.X < cx+cw && msg.Y >= cy && msg.Y < cy+ch
+
+	if inContent || m.activePane == paneContent {
+		_, paneH := m.contentPaneDims()
+		contentH := paneH - 2
+		maxOff := len(m.contentLines) - contentH
+		if maxOff < 0 {
+			maxOff = 0
+		}
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.contentOffset -= 3
+			if m.contentOffset < 0 {
+				m.contentOffset = 0
+			}
+		case tea.MouseWheelDown:
+			m.contentOffset += 3
+			if m.contentOffset > maxOff {
+				m.contentOffset = maxOff
+			}
+		}
+		return m, nil
+	}
+
+	// Scroll sidebar
+	if m.directFile == "" {
+		sidebarH := m.height - 5
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.sidebarOffset -= 3
+			if m.sidebarOffset < 0 {
+				m.sidebarOffset = 0
+			}
+		case tea.MouseWheelDown:
+			maxOff := len(m.sidebar) - sidebarH
+			if maxOff < 0 {
+				maxOff = 0
+			}
+			m.sidebarOffset += 3
+			if m.sidebarOffset > maxOff {
+				m.sidebarOffset = maxOff
+			}
+		}
+	}
+	return m, nil
+}
+
+// extractSelectedText gets text from contentLines within the selection rectangle.
+func (m model) extractSelectedText() string {
+	if !m.mouseHasSelection || len(m.contentLines) == 0 {
+		return ""
+	}
+
+	cx, cy, cw, _ := m.contentPaneRect()
+
+	// Normalize selection coordinates to content-relative
+	startRow, startCol := m.mouseSelStart[0], m.mouseSelStart[1]
+	endRow, endCol := m.mouseSelEnd[0], m.mouseSelEnd[1]
+
+	// Ensure start <= end
+	if startRow > endRow || (startRow == endRow && startCol > endCol) {
+		startRow, endRow = endRow, startRow
+		startCol, endCol = endCol, startCol
+	}
+
+	// Convert screen coords to content line indices
+	contentStartY := cy + 2 // title + separator
+	startLine := (startRow - contentStartY) + m.contentOffset
+	endLine := (endRow - contentStartY) + m.contentOffset
+
+	if startLine < 0 {
+		startLine = 0
+	}
+	if endLine >= len(m.contentLines) {
+		endLine = len(m.contentLines) - 1
+	}
+	if startLine > endLine {
+		return ""
+	}
+
+	// Convert X positions to content-relative
+	relStartCol := startCol - cx
+	relEndCol := endCol - cx
+	if relStartCol < 0 {
+		relStartCol = 0
+	}
+	if relEndCol > cw {
+		relEndCol = cw
+	}
+
+	var lines []string
+	for i := startLine; i <= endLine; i++ {
+		line := m.contentLines[i]
+		// Strip ANSI for text extraction
+		plain := ansi.Strip(line)
+
+		sc := 0
+		ec := len(plain)
+		if i == startLine {
+			sc = relStartCol
+		}
+		if i == endLine {
+			ec = relEndCol
+		}
+		if sc > len(plain) {
+			sc = len(plain)
+		}
+		if ec > len(plain) {
+			ec = len(plain)
+		}
+		if sc < ec {
+			lines = append(lines, plain[sc:ec])
+		} else {
+			lines = append(lines, "")
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// copyToClipboard copies text to the system clipboard.
+func copyToClipboard(text string) tea.Cmd {
+	return func() tea.Msg {
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("pbcopy")
+		case "linux":
+			// Try wl-copy first (Wayland), then xclip (X11)
+			if _, err := exec.LookPath("wl-copy"); err == nil {
+				cmd = exec.Command("wl-copy")
+			} else if _, err := exec.LookPath("xclip"); err == nil {
+				cmd = exec.Command("xclip", "-selection", "clipboard")
+			} else if _, err := exec.LookPath("xsel"); err == nil {
+				cmd = exec.Command("xsel", "--clipboard", "--input")
+			} else {
+				return statusClearMsg{}
+			}
+		default:
+			return statusClearMsg{}
+		}
+		cmd.Stdin = strings.NewReader(text)
+		cmd.Run()
+		return statusClearMsg{}
+	}
 }
 
 // ── Export overlay ──
@@ -1006,11 +1804,15 @@ func (m model) View() tea.View {
 			s = m.renderProjectDetail()
 		}
 	}
+	if m.sessionSearch.active {
+		s = m.renderSessionSearchOverlay()
+	}
 	if m.export.active {
 		s = m.renderExportOverlay()
 	}
 	v := tea.NewView(s)
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
 	return v
 }
 
@@ -1020,15 +1822,38 @@ func (m model) renderProjectList() string {
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Width(m.width).Render(" ccview "))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+
+	// Tab bar (only shown when multiple providers have data)
+	tabBarH := 0
+	if m.hasMultipleTabs() {
+		tabBarH = 2
+		var tabs []string
+		for i, prov := range m.providers {
+			t := m.providerTrees[i]
+			if t == nil || len(t.Projects) == 0 {
+				continue
+			}
+			label := fmt.Sprintf(" %d: %s (%d) ", i+1, prov.Name(), len(t.Projects))
+			if i == m.providerTab {
+				tabs = append(tabs, selectedStyle.Render(label))
+			} else {
+				tabs = append(tabs, dimStyle.Render(label))
+			}
+		}
+		b.WriteString("\n " + strings.Join(tabs, "  "))
+		b.WriteString("\n")
+	} else {
+		b.WriteString("\n")
+	}
 
 	if m.tree == nil || len(m.tree.Projects) == 0 {
-		b.WriteString("  No projects found in ~/.claude/\n\n")
+		b.WriteString("  No projects found.\n\n")
 		b.WriteString(statusStyle.Render("  q: quit"))
 		return b.String()
 	}
 
-	viewH := m.height - 5
+	viewH := m.height - 5 - tabBarH
 	itemH := 3
 	maxVisible := viewH / itemH
 	if maxVisible < 1 {
@@ -1091,7 +1916,11 @@ func (m model) renderProjectList() string {
 
 	// Status
 	total := len(m.tree.Projects)
-	b.WriteString(statusStyle.Render(fmt.Sprintf(" %d projects | enter: open | j/k: navigate | q: quit", total)))
+	hint := " %d projects | enter: open | j/k: navigate | q: quit"
+	if m.hasMultipleTabs() {
+		hint = " %d projects | enter: open | j/k: navigate | tab/1-2: switch | q: quit"
+	}
+	b.WriteString(statusStyle.Render(fmt.Sprintf(hint, total)))
 
 	return b.String()
 }
@@ -1172,7 +2001,18 @@ func (m model) renderFullWidth() string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(statusStyle.Render(" j/k: scroll | pgup/pgdn | e: export | q: quit"))
+	if m.contentSearchActive {
+		query := string(m.contentSearchInput)
+		matchInfo := ""
+		if len(m.contentMatches) > 0 {
+			matchInfo = fmt.Sprintf("  %d/%d", m.contentMatchIdx+1, len(m.contentMatches))
+		} else if len(query) > 0 {
+			matchInfo = "  no matches"
+		}
+		b.WriteString(statusHighlight.Render(" /") + statusStyle.Render(query+"\u2588") + dimStyle.Render(matchInfo))
+	} else {
+		b.WriteString(statusStyle.Render(" j/k: scroll | pgup/pgdn | /: search | e: export | q: quit"))
+	}
 	return b.String()
 }
 
@@ -1366,6 +2206,90 @@ func (m model) buildContentLines(w, h int) []string {
 		}
 	}
 
+	// Apply mouse selection highlighting
+	if m.mouseHasSelection && m.activePane == paneContent {
+		cx, cy, _, _ := m.contentPaneRect()
+		startRow, startCol := m.mouseSelStart[0], m.mouseSelStart[1]
+		endRow, endCol := m.mouseSelEnd[0], m.mouseSelEnd[1]
+		if startRow > endRow || (startRow == endRow && startCol > endCol) {
+			startRow, endRow = endRow, startRow
+			startCol, endCol = endCol, startCol
+		}
+		selStyle := lipgloss.NewStyle().Reverse(true)
+		for idx := range lines {
+			screenY := cy + idx
+			if screenY < startRow || screenY > endRow {
+				continue
+			}
+			plain := ansi.Strip(lines[idx])
+			sc := 0
+			ec := len(plain)
+			if screenY == startRow {
+				sc = startCol - cx
+			}
+			if screenY == endRow {
+				ec = endCol - cx
+			}
+			if sc < 0 {
+				sc = 0
+			}
+			if ec > len(plain) {
+				ec = len(plain)
+			}
+			if sc >= ec || sc >= len(plain) {
+				continue
+			}
+			lines[idx] = plain[:sc] + selStyle.Render(plain[sc:ec]) + plain[ec:]
+		}
+	}
+
+	// Apply content search highlighting
+	if m.contentSearchQuery != "" && len(m.contentMatches) > 0 {
+		highlightStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color("#D97706")).
+			Foreground(lipgloss.Color("#000000"))
+		currentMatchStyle := lipgloss.NewStyle().
+			Background(lipgloss.Color("#FBBF24")).
+			Foreground(lipgloss.Color("#000000")).
+			Bold(true)
+		q := strings.ToLower(m.contentSearchQuery)
+		for idx := range lines {
+			lineIdx := m.contentOffset + idx - 2 // subtract header lines
+			if lineIdx < 0 {
+				continue
+			}
+			plain := ansi.Strip(lines[idx])
+			plainLower := strings.ToLower(plain)
+			if !strings.Contains(plainLower, q) {
+				continue
+			}
+			// Determine if this is the current match line
+			isCurrentMatch := false
+			if m.contentMatchIdx >= 0 && m.contentMatchIdx < len(m.contentMatches) {
+				isCurrentMatch = m.contentMatches[m.contentMatchIdx] == lineIdx
+			}
+			// Rebuild line with highlighted matches
+			var result strings.Builder
+			pos := 0
+			for {
+				i := strings.Index(plainLower[pos:], q)
+				if i < 0 {
+					result.WriteString(plain[pos:])
+					break
+				}
+				result.WriteString(plain[pos : pos+i])
+				matchEnd := pos + i + len(q)
+				if isCurrentMatch {
+					result.WriteString(currentMatchStyle.Render(plain[pos+i : matchEnd]))
+				} else {
+					result.WriteString(highlightStyle.Render(plain[pos+i : matchEnd]))
+				}
+				pos = matchEnd
+			}
+			lines[idx] = result.String()
+		}
+	}
+
 	for len(lines) < h {
 		lines = append(lines, "")
 	}
@@ -1375,6 +2299,21 @@ func (m model) buildContentLines(w, h int) []string {
 // ── Status bar ──
 
 func (m model) renderStatus() string {
+	// Content search input bar
+	if m.contentSearchActive {
+		query := string(m.contentSearchInput)
+		matchInfo := ""
+		if len(m.contentMatches) > 0 {
+			matchInfo = fmt.Sprintf("  %d/%d", m.contentMatchIdx+1, len(m.contentMatches))
+		} else if len(query) > 0 {
+			matchInfo = "  no matches"
+		}
+		return statusHighlight.Render(" /") +
+			statusStyle.Render(query+"\u2588") +
+			dimStyle.Render(matchInfo) +
+			statusStyle.Render("  enter:search  esc:cancel")
+	}
+
 	if m.statusMsg != "" {
 		return statusHighlight.Render(" " + m.statusMsg)
 	}
@@ -1383,7 +2322,7 @@ func (m model) renderStatus() string {
 	if m.activePane == paneSidebar {
 		parts = append(parts,
 			statusHighlight.Render("sidebar")+statusStyle.Render("/viewer"),
-			"enter:open", "o:editor", "esc:back", "tab:viewer", "e:export", "q:quit",
+			"enter:open", "o:editor", "esc:back", "tab:viewer", "e:export", "/:search", "q:quit",
 		)
 	} else {
 		parts = append(parts,
@@ -1398,7 +2337,10 @@ func (m model) renderStatus() string {
 			}
 			parts = append(parts, fmt.Sprintf("%d%%", pct))
 		}
-		parts = append(parts, "j/k:scroll", "pgup/dn", "tab:sidebar", "e:export", "q:quit")
+		if len(m.contentMatches) > 0 {
+			parts = append(parts, fmt.Sprintf("%d/%d", m.contentMatchIdx+1, len(m.contentMatches)))
+		}
+		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "tab:sidebar", "e:export", "q:quit")
 	}
 	return statusStyle.Render(" " + strings.Join(parts, "  "))
 }
