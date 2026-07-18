@@ -10,7 +10,10 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-var debugStart time.Time
+var (
+	debugStart time.Time
+	version    = "dev"
+)
 
 func debugLog(format string, args ...any) {
 	if debugStart.IsZero() {
@@ -26,7 +29,13 @@ func main() {
 	web := flag.Bool("web", false, "Start web server for interactive browsing")
 	port := flag.Int("port", 3333, "Port for web server (used with --web)")
 	debugLog := flag.String("debug", "", "Write debug timing logs to this file")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("ccview", version)
+		return
+	}
 
 	// Accept positional argument as file path
 	if *filePath == "" && flag.NArg() > 0 {

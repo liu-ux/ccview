@@ -2,3 +2,6 @@
 
 *.html
 ccview
+ccview.exe
+ccview.exe~
+dist/
