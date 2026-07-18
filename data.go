@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -178,7 +179,7 @@ func loadProjects(projectsDir, fileHistoryDir string, historyTitles map[string]s
 			continue
 		}
 		dirPath := filepath.Join(projectsDir, e.Name())
-		proj := loadProject(e.Name(), dirPath, fileHistoryDir, historyTitles)
+		proj := loadProject(context.Background(), e.Name(), dirPath, fileHistoryDir, historyTitles)
 		if len(proj.Conversations) > 0 || proj.ClaudeMD != "" || len(proj.MemoryFiles) > 0 {
 			projects = append(projects, proj)
 		}
@@ -191,7 +192,7 @@ func loadProjects(projectsDir, fileHistoryDir string, historyTitles map[string]s
 	return projects
 }
 
-func loadProject(dirName, dirPath, fileHistoryDir string, historyTitles map[string]string) TreeProject {
+func loadProject(ctx context.Context, dirName, dirPath, fileHistoryDir string, historyTitles map[string]string) TreeProject {
 	proj := TreeProject{
 		DirName:     dirName,
 		DirPath:     dirPath,
@@ -217,6 +218,13 @@ func loadProject(dirName, dirPath, fileHistoryDir string, historyTitles map[stri
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
 			continue
+		}
+
+		// Check if this load was cancelled (user navigated away)
+		select {
+		case <-ctx.Done():
+			return proj
+		default:
 		}
 
 		convPath := filepath.Join(dirPath, e.Name())
@@ -339,6 +347,130 @@ func findSubAgents(dir string) []TreeSubAgent {
 	}
 
 	return agents
+}
+
+// ── Lazy-loading functions ──
+
+// loadProjectDirs returns a minimal TreeData with project directory names
+// and conversation counts derived from directory listings (no file reads).
+// This is the Level 0 loader — instant, no JSONL parsing.
+func loadProjectDirs() (*TreeData, error) {
+	debugLog("loadProjectDirs: start")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	projectsDir := filepath.Join(claudeDir, "projects")
+
+	entries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var projects []TreeProject
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dirPath := filepath.Join(projectsDir, e.Name())
+
+		// Count .jsonl files without reading them
+		convCount := 0
+		if dirEntries, err := os.ReadDir(dirPath); err == nil {
+			for _, de := range dirEntries {
+				if !de.IsDir() && strings.HasSuffix(de.Name(), ".jsonl") {
+					convCount++
+				}
+			}
+		}
+		if convCount == 0 {
+			continue
+		}
+
+		projects = append(projects, TreeProject{
+			DisplayName: e.Name(),
+			DirName:     e.Name(),
+			DirPath:     dirPath,
+			Source:      "claude",
+			ConvCount:   convCount,
+		})
+	}
+
+	data := &TreeData{
+		ClaudeDir: claudeDir,
+		Projects:  projects,
+	}
+	data.Stats.TotalProjects = len(projects)
+	debugLog("loadProjectDirs: done, %d projects", len(projects))
+	return data, nil
+}
+
+// enrichProjectMeta fills in display name, last active time, CLAUDE.md, and
+// memory files for a single project without scanning conversation contents.
+// This is the Level 1 loader — reads only directory metadata and file stats.
+func enrichProjectMeta(dirName, dirPath string) TreeProject {
+	debugLog("enrichProjectMeta: %s", dirName)
+	proj := TreeProject{
+		DisplayName: dirName,
+		DirName:     dirName,
+		DirPath:     dirPath,
+		Source:      "claude",
+	}
+
+	// CLAUDE.md
+	claudeMD := filepath.Join(dirPath, "CLAUDE.md")
+	if fileExists(claudeMD) {
+		proj.ClaudeMD = claudeMD
+	}
+
+	// Memory
+	memDir := filepath.Join(dirPath, "memory")
+	if dirExists(memDir) {
+		proj.MemoryFiles = loadFileRefs(memDir, ".md")
+	}
+
+	// Conversation count + last active from file mod times
+	entries, _ := os.ReadDir(dirPath)
+	var latestMod time.Time
+	convCount := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		convCount++
+		if info, err := e.Info(); err == nil {
+			if info.ModTime().After(latestMod) {
+				latestMod = info.ModTime()
+			}
+		}
+	}
+	proj.ConvCount = convCount
+	if !latestMod.IsZero() {
+		proj.LastActive = latestMod.Format(time.RFC3339)
+	}
+
+	return proj
+}
+
+// loadProjectDetail loads a single project's full conversation list including
+// metadata, sub-agents, and tool results. This is the Level 2 loader.
+// If historyTitles is nil, it is loaded from disk (and should be cached by the caller).
+// The ctx is checked between file scans; if cancelled, returns nil early.
+func loadProjectDetail(ctx context.Context, dirName, dirPath string, historyTitles map[string]string) *TreeProject {
+	debugLog("loadProjectDetail: start %s", dirName)
+	if historyTitles == nil {
+		home, _ := os.UserHomeDir()
+		historyTitles = loadHistoryTitles(filepath.Join(home, ".claude", "history.jsonl"))
+	}
+	fileHistoryDir := filepath.Join(filepath.Dir(filepath.Dir(dirPath)), "file-history")
+	proj := loadProject(ctx, dirName, dirPath, fileHistoryDir, historyTitles)
+	if len(proj.Conversations) == 0 && proj.ClaudeMD == "" && len(proj.MemoryFiles) == 0 {
+		debugLog("loadProjectDetail: %s returned nil (empty)", dirName)
+		return nil
+	}
+	debugLog("loadProjectDetail: done %s, %d convs", dirName, len(proj.Conversations))
+	return &proj
 }
 
 // ── Helpers ──

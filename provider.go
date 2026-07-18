@@ -1,11 +1,23 @@
 package main
 
+import "context"
+
 // Provider abstracts a session data source (Claude Code, OpenCode, etc.).
 type Provider interface {
 	Name() string
 	Available() bool
+	// LoadTree loads all data (used by web API and search).
 	LoadTree() (*TreeData, error)
+	// LoadProjectList returns project directories with conversation counts only (Level 0).
+	LoadProjectList() (*TreeData, error)
+	// EnrichProjectMeta fills in display name, last active, CLAUDE.md, memory (Level 1).
+	EnrichProjectMeta(dirName, dirPath string) TreeProject
+	// LoadProjectDetail loads a single project's full conversation list (Level 2).
+	// The ctx is checked between file scans; if cancelled, returns partial results early.
+	LoadProjectDetail(ctx context.Context, dirName, dirPath string, historyTitles map[string]string) *TreeProject
+	// LoadConversation loads a single conversation's entries.
 	LoadConversation(path string) ([]Entry, error)
+	// SearchSessions searches across sessions.
 	SearchSessions(query, projectID string) []SearchResult
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -237,6 +238,27 @@ func (p *OpenCodeProvider) loadChildSessions(db *sql.DB, parentID string) []Tree
 		})
 	}
 	return agents
+}
+
+func (p *OpenCodeProvider) LoadProjectList() (*TreeData, error) {
+	return p.LoadTree()
+}
+
+func (p *OpenCodeProvider) EnrichProjectMeta(dirName, dirPath string) TreeProject {
+	return TreeProject{DirName: dirName, DirPath: dirPath, Source: "opencode"}
+}
+
+func (p *OpenCodeProvider) LoadProjectDetail(ctx context.Context, dirName, dirPath string, historyTitles map[string]string) *TreeProject {
+	tree, err := p.LoadTree()
+	if err != nil {
+		return nil
+	}
+	for i := range tree.Projects {
+		if tree.Projects[i].DirName == dirName {
+			return &tree.Projects[i]
+		}
+	}
+	return nil
 }
 
 func (p *OpenCodeProvider) LoadConversation(sessionID string) ([]Entry, error) {

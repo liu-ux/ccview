@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -73,14 +75,18 @@ type model struct {
 	projOffset int
 
 	// Project detail screen
-	activePane       pane
-	projIndex        int          // index into tree.Projects
-	currentProj      *TreeProject // pointer to selected project
-	currentProvider  Provider     // provider for current project
-	sidebar          []sidebarItem
-	sidebarCursor    int
-	sidebarOffset    int
-	expandedConvPath string // which conversation's subagents are visible
+	activePane           pane
+	projIndex            int          // index into tree.Projects
+	currentProj          *TreeProject // pointer to selected project
+	currentProvider      Provider     // provider for current project
+	sidebar              []sidebarItem
+	sidebarCursor        int
+	sidebarOffset        int
+	expandedConvPath     string // which conversation's subagents are visible
+	historyTitles        map[string]string // cached history.jsonl titles
+	projectDetailLoading bool              // true while Level 2 is loading
+	loadGeneration       int               // incremented on each openProject, used to discard stale results
+	cancelCurrentLoad    context.CancelFunc // cancels the in-flight Level 2 load goroutine
 
 	// Content pane
 	contentLines  []string
@@ -184,6 +190,30 @@ type searchDebounceMsg struct {
 	kind string // "content" or "session"
 }
 
+// ── Lazy-loading messages ──
+
+type projectListReadyMsg struct {
+	index int      // provider index
+	tree  *TreeData // Level 0: project dirs + conv counts
+	err   error
+}
+
+type projectMetaReadyMsg struct {
+	index    int
+	projects []TreeProject // Level 1: enriched with display names + last active
+}
+
+type projectDetailReadyMsg struct {
+	providerIdx int
+	projIdx     int
+	proj        *TreeProject // Level 2: full conversation list
+	generation  int          // discarded if != current loadGeneration
+}
+
+type historyTitlesLoadedMsg struct {
+	titles map[string]string
+}
+
 // ── Styles ──
 
 var (
@@ -274,10 +304,11 @@ func newModel(directFile string, providers []Provider) model {
 }
 
 func (m model) Init() tea.Cmd {
+	debugLog("Init: providers=%d", len(m.providers))
 	if m.directFile != "" {
 		return loadConvCmd(m.directFile, m.directFile, 120, nil)
 	}
-	return m.loadAllTreesCmd()
+	return m.loadAllProjectListsCmd()
 }
 
 // treeLoadedMsg is now per-provider.
@@ -287,16 +318,46 @@ type providerTreeLoadedMsg struct {
 	err   error
 }
 
-func (m model) loadAllTreesCmd() tea.Cmd {
+// loadAllProjectListsCmd starts Level 0 loading for all providers.
+func (m model) loadAllProjectListsCmd() tea.Cmd {
 	cmds := make([]tea.Cmd, len(m.providers))
 	for i, prov := range m.providers {
 		i, prov := i, prov
 		cmds[i] = func() tea.Msg {
-			tree, err := prov.LoadTree()
-			return providerTreeLoadedMsg{i, tree, err}
+			tree, err := prov.LoadProjectList()
+			return projectListReadyMsg{i, tree, err}
 		}
 	}
 	return tea.Batch(cmds...)
+}
+
+// loadProjectMetaCmd starts Level 1 enrichment for all projects in a tree.
+func loadProjectMetaCmd(providerIdx int, provider Provider, tree *TreeData) tea.Cmd {
+	return func() tea.Msg {
+		enriched := make([]TreeProject, len(tree.Projects))
+		for i, proj := range tree.Projects {
+			enriched[i] = provider.EnrichProjectMeta(proj.DirName, proj.DirPath)
+			enriched[i].Source = proj.Source
+		}
+		return projectMetaReadyMsg{providerIdx, enriched}
+	}
+}
+
+// loadProjectDetailCmd starts Level 2 loading for a single project.
+func loadProjectDetailCmd(ctx context.Context, providerIdx, projIdx int, provider Provider, dirName, dirPath string, historyTitles map[string]string, generation int) tea.Cmd {
+	return func() tea.Msg {
+		proj := provider.LoadProjectDetail(ctx, dirName, dirPath, historyTitles)
+		return projectDetailReadyMsg{providerIdx, projIdx, proj, generation}
+	}
+}
+
+// loadHistoryTitlesCmd loads history.jsonl titles in the background.
+func loadHistoryTitlesCmd() tea.Cmd {
+	return func() tea.Msg {
+		home, _ := os.UserHomeDir()
+		titles := loadHistoryTitles(filepath.Join(home, ".claude", "history.jsonl"))
+		return historyTitlesLoadedMsg{titles}
+	}
 }
 
 func loadConvCmd(path, title string, width int, provider Provider) tea.Cmd {
@@ -427,6 +488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case providerTreeLoadedMsg:
+		debugLog("providerTreeLoadedMsg: index=%d err=%v", msg.index, msg.err)
 		// Initialize providerTrees slice if needed
 		if m.providerTrees == nil {
 			m.providerTrees = make([]*TreeData, len(m.providers))
@@ -471,6 +533,123 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.state = viewProjectList
+
+		// Start Level 1 enrichment for Claude providers (which have lightweight Level 0 data)
+		// Also start loading history titles for later use in Level 2
+		var cmds []tea.Cmd
+		cmds = append(cmds, loadHistoryTitlesCmd())
+		for i, prov := range m.providers {
+			tree := m.providerTrees[i]
+			if tree != nil && len(tree.Projects) > 0 && tree.Projects[0].LastActive == "" {
+				cmds = append(cmds, loadProjectMetaCmd(i, prov, tree))
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	case projectListReadyMsg:
+		// Level 0 loaded — same logic as providerTreeLoadedMsg but from LoadProjectList()
+		debugLog("projectListReadyMsg: index=%d err=%v projects=%d", msg.index, msg.err, len(msg.tree.Projects))
+		if m.providerTrees == nil {
+			m.providerTrees = make([]*TreeData, len(m.providers))
+		}
+		if msg.index >= 0 && msg.index < len(m.providerTrees) {
+			if msg.err == nil && msg.tree != nil {
+				m.providerTrees[msg.index] = msg.tree
+			} else {
+				m.providerTrees[msg.index] = &TreeData{}
+			}
+		}
+		loaded := 0
+		for _, t := range m.providerTrees {
+			if t != nil {
+				loaded++
+			}
+		}
+		if loaded < len(m.providers) {
+			return m, nil
+		}
+		if m.directFile != "" {
+			return m, nil
+		}
+		for i, t := range m.providerTrees {
+			if t != nil && len(t.Projects) > 0 {
+				m.providerTab = i
+				m.tree = t
+				break
+			}
+		}
+		if m.tree == nil {
+			for i, t := range m.providerTrees {
+				if t != nil {
+					m.providerTab = i
+					m.tree = t
+					break
+				}
+			}
+		}
+		m.state = viewProjectList
+		debugLog("projectListReadyMsg: state=viewProjectList, starting Level 1 enrichment")
+
+		// Start Level 1 enrichment + history titles
+		var cmds []tea.Cmd
+		cmds = append(cmds, loadHistoryTitlesCmd())
+		for i, prov := range m.providers {
+			tree := m.providerTrees[i]
+			if tree != nil && len(tree.Projects) > 0 && tree.Projects[0].LastActive == "" {
+				cmds = append(cmds, loadProjectMetaCmd(i, prov, tree))
+			}
+		}
+		return m, tea.Batch(cmds...)
+
+	case projectMetaReadyMsg:
+		// Level 1 enrichment complete — update project metadata in-place
+		debugLog("projectMetaReadyMsg: index=%d projects=%d", msg.index, len(msg.projects))
+		if msg.index >= 0 && msg.index < len(m.providerTrees) {
+			tree := m.providerTrees[msg.index]
+			if tree != nil && len(msg.projects) == len(tree.Projects) {
+				for i := range tree.Projects {
+					tree.Projects[i].DisplayName = msg.projects[i].DisplayName
+					tree.Projects[i].LastActive = msg.projects[i].LastActive
+					tree.Projects[i].ClaudeMD = msg.projects[i].ClaudeMD
+					tree.Projects[i].MemoryFiles = msg.projects[i].MemoryFiles
+				}
+				// Re-sort by last active
+				sort.Slice(tree.Projects, func(a, b int) bool {
+					return tree.Projects[a].LastActive > tree.Projects[b].LastActive
+				})
+			}
+		}
+		return m, nil
+
+	case projectDetailReadyMsg:
+		// Level 2 loading complete — replace project data and build sidebar
+		debugLog("projectDetailReadyMsg: providerIdx=%d projIdx=%d proj=%v gen=%d current=%d", msg.providerIdx, msg.projIdx, msg.proj != nil, msg.generation, m.loadGeneration)
+		// Discard stale results from a previous project navigation
+		if msg.generation != m.loadGeneration {
+			debugLog("projectDetailReadyMsg: discarded stale result (gen %d != %d)", msg.generation, m.loadGeneration)
+			return m, nil
+		}
+		if msg.proj != nil && msg.providerIdx >= 0 && msg.providerIdx < len(m.providerTrees) {
+			tree := m.providerTrees[msg.providerIdx]
+			if tree != nil && msg.projIdx >= 0 && msg.projIdx < len(tree.Projects) {
+				tree.Projects[msg.projIdx] = *msg.proj
+				// If this is the currently viewed project, rebuild sidebar
+				if m.currentProj != nil && m.currentProj.DirName == msg.proj.DirName {
+					m.currentProj = &tree.Projects[msg.projIdx]
+					m.sidebar = buildSidebar(m.currentProj, tree.Plans, m.expandedConvPath)
+					m.sidebarCursor = 0
+					if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
+						m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
+					}
+				}
+			}
+		}
+		m.projectDetailLoading = false
+		return m, nil
+
+	case historyTitlesLoadedMsg:
+		debugLog("historyTitlesLoadedMsg: %d titles", len(msg.titles))
+		m.historyTitles = msg.titles
 		return m, nil
 
 	case contentLoadedMsg:
@@ -527,10 +706,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.switchProviderTab(msg.providerIdx)
 		}
 		// Open the project
-		m.openProject(msg.projIdx)
-		// Load the conversation
-		_, rw := m.paneWidths()
-		return m, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider)
+		cmd := m.openProject(msg.projIdx)
+		// If project detail is loaded, also load the conversation
+		if !m.projectDetailLoading {
+			_, rw := m.paneWidths()
+			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider))
+		}
+		return m, cmd
 
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
@@ -637,8 +819,8 @@ func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "end", "G":
 		m.projCursor = len(m.tree.Projects) - 1
 	case "enter", "l", "right":
-		m.openProject(m.projCursor)
-		return m, nil
+		cmd := m.openProject(m.projCursor)
+		return m, cmd
 	case "/":
 		m.openSessionSearch(searchScopeGlobal)
 		return m, nil
@@ -665,27 +847,56 @@ func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) openProject(idx int) {
+func (m *model) openProject(idx int) tea.Cmd {
+	debugLog("openProject: idx=%d total=%d", idx, len(m.tree.Projects))
 	if idx < 0 || idx >= len(m.tree.Projects) {
-		return
+		return nil
 	}
 	m.projIndex = idx
 	m.currentProj = &m.tree.Projects[idx]
 	// Set the provider for this project based on its source
 	m.currentProvider = m.providers[m.providerTab]
 	m.expandedConvPath = ""
-	m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
-	m.sidebarCursor = 0
-	// Move cursor to first navigable item
-	if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
-		m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
-	}
 	m.sidebarOffset = 0
 	m.activePane = paneSidebar
 	m.contentLines = nil
 	m.contentTitle = ""
 	m.contentPath = ""
 	m.state = viewProjectDetail
+
+	// If conversations are already loaded (Level 2 done), build sidebar immediately
+	if len(m.currentProj.Conversations) > 0 {
+		m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
+		m.sidebarCursor = 0
+		if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
+			m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
+		}
+		m.projectDetailLoading = false
+		return nil
+	}
+
+	// Level 2 not loaded yet — show loading state and trigger async load
+	// Cancel any in-flight load from a previous project
+	if m.cancelCurrentLoad != nil {
+		m.cancelCurrentLoad()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.cancelCurrentLoad = cancel
+
+	m.projectDetailLoading = true
+	m.loadGeneration++
+	gen := m.loadGeneration
+	m.sidebar = []sidebarItem{
+		{kind: "back", label: "< Back to Projects"},
+		{kind: "separator"},
+		{kind: "header", label: "Loading conversations..."},
+	}
+	m.sidebarCursor = 0
+	return loadProjectDetailCmd(
+		ctx, m.providerTab, idx, m.currentProvider,
+		m.currentProj.DirName, m.currentProj.DirPath,
+		m.historyTitles, gen,
+	)
 }
 
 func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {

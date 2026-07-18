@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,18 @@ func (p *ClaudeProvider) LoadTree() (*TreeData, error) {
 
 func (p *ClaudeProvider) LoadConversation(path string) ([]Entry, error) {
 	return parseConversation(path)
+}
+
+func (p *ClaudeProvider) LoadProjectList() (*TreeData, error) {
+	return loadProjectDirs()
+}
+
+func (p *ClaudeProvider) EnrichProjectMeta(dirName, dirPath string) TreeProject {
+	return enrichProjectMeta(dirName, dirPath)
+}
+
+func (p *ClaudeProvider) LoadProjectDetail(ctx context.Context, dirName, dirPath string, historyTitles map[string]string) *TreeProject {
+	return loadProjectDetail(ctx, dirName, dirPath, historyTitles)
 }
 
 func (p *ClaudeProvider) SearchSessions(query, projectID string) []SearchResult {

@@ -3,21 +3,44 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
+
+var debugStart time.Time
+
+func debugLog(format string, args ...any) {
+	if debugStart.IsZero() {
+		return
+	}
+	log.Printf(format, args...)
+}
 
 func main() {
 	exportPath := flag.String("export", "", "Export conversation to HTML file")
 	filePath := flag.String("file", "", "Path to a specific JSONL conversation file")
 	web := flag.Bool("web", false, "Start web server for interactive browsing")
 	port := flag.Int("port", 3333, "Port for web server (used with --web)")
+	debugLog := flag.String("debug", "", "Write debug timing logs to this file")
 	flag.Parse()
 
 	// Accept positional argument as file path
 	if *filePath == "" && flag.NArg() > 0 {
 		*filePath = flag.Arg(0)
+	}
+
+	// Debug logging
+	if *debugLog != "" {
+		f, err := os.OpenFile(*debugLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err == nil {
+			log.SetOutput(f)
+			log.SetFlags(log.Ltime | log.Lmicroseconds)
+			debugStart = time.Now()
+			log.Printf("main: startup")
+		}
 	}
 
 	// Web server mode
