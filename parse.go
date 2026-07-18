@@ -311,6 +311,39 @@ func formatToolUse(name string, input json.RawMessage) string {
 	}
 }
 
+// formatToolInput pretty-prints tool input JSON for the detail toggle view.
+// Long string values are truncated to maxLen characters.
+func formatToolInput(input json.RawMessage, width int) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(input, &m); err != nil {
+		return string(input)
+	}
+	maxValLen := 200
+	if width > 0 && maxValLen > width {
+		maxValLen = width
+	}
+	var b strings.Builder
+	b.WriteString("{")
+	first := true
+	for k, v := range m {
+		if !first {
+			b.WriteString(",")
+		}
+		first = false
+		b.WriteString("\n")
+		val := fmt.Sprintf("%v", v)
+		if len(val) > maxValLen {
+			val = val[:maxValLen-3] + "..."
+		}
+		fmt.Fprintf(&b, "  %q: %q", k, val)
+	}
+	b.WriteString("\n}")
+	return b.String()
+}
+
 func formatTimestamp(ts string) string {
 	for _, layout := range []string{
 		time.RFC3339Nano, time.RFC3339,

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -373,4 +375,162 @@ func TestContextCancellation_StopsLoad(t *testing.T) {
 	if proj != nil && len(proj.Conversations) == 50 {
 		t.Error("context cancellation did not stop scanning")
 	}
+}
+
+// ── findProjectByName ──
+
+func TestFindProjectByName_ExactDirName(t *testing.T) {
+	m := model{
+		tree: &TreeData{
+			Projects: []TreeProject{
+				{DirName: "my-app--src", DisplayName: "~/src/my-app"},
+				{DirName: "other--code", DisplayName: "~/code/other"},
+			},
+		},
+	}
+	if idx := m.findProjectByName("my-app--src"); idx != 0 {
+		t.Errorf("expected 0, got %d", idx)
+	}
+}
+
+func TestFindProjectByName_ExactDisplayName(t *testing.T) {
+	m := model{
+		tree: &TreeData{
+			Projects: []TreeProject{
+				{DirName: "hash--src", DisplayName: "~/src/my-app"},
+			},
+		},
+	}
+	if idx := m.findProjectByName("~/src/my-app"); idx != 0 {
+		t.Errorf("expected 0, got %d", idx)
+	}
+}
+
+func TestFindProjectByName_Substring(t *testing.T) {
+	m := model{
+		tree: &TreeData{
+			Projects: []TreeProject{
+				{DirName: "my-app--src-code", DisplayName: "~/src/my-app"},
+				{DirName: "other-project", DisplayName: "~/other"},
+			},
+		},
+	}
+	if idx := m.findProjectByName("my-app"); idx != 0 {
+		t.Errorf("expected 0, got %d", idx)
+	}
+}
+
+func TestFindProjectByName_CaseInsensitive(t *testing.T) {
+	m := model{
+		tree: &TreeData{
+			Projects: []TreeProject{
+				{DirName: "MyApp--src"},
+			},
+		},
+	}
+	if idx := m.findProjectByName("myapp"); idx != 0 {
+		t.Errorf("expected 0, got %d", idx)
+	}
+}
+
+func TestFindProjectByName_NoMatch(t *testing.T) {
+	m := model{
+		tree: &TreeData{
+			Projects: []TreeProject{
+				{DirName: "my-app--src"},
+			},
+		},
+	}
+	if idx := m.findProjectByName("nonexistent"); idx != -1 {
+		t.Errorf("expected -1, got %d", idx)
+	}
+}
+
+// ── formatToolInput ──
+
+func TestFormatToolInput_BasicJSON(t *testing.T) {
+	input := json.RawMessage(`{"command":"npm test","description":"run tests"}`)
+	result := formatToolInput(input, 80)
+	if !strings.Contains(result, "npm test") {
+		t.Errorf("expected 'npm test' in output, got %s", result)
+	}
+	if !strings.Contains(result, "description") {
+		t.Errorf("expected 'description' key in output, got %s", result)
+	}
+}
+
+func TestFormatToolInput_TruncatesLongValues(t *testing.T) {
+	longVal := strings.Repeat("x", 300)
+	input := json.RawMessage(`{"content":"` + longVal + `"}`)
+	result := formatToolInput(input, 80)
+	if strings.Contains(result, longVal) {
+		t.Error("expected long value to be truncated")
+	}
+	if !strings.Contains(result, "...") {
+		t.Error("expected truncation marker '...'")
+	}
+}
+
+func TestFormatToolInput_EmptyInput(t *testing.T) {
+	result := formatToolInput(json.RawMessage(`{}`), 80)
+	if !strings.Contains(result, "{") || !strings.Contains(result, "}") {
+		t.Errorf("expected JSON braces in output, got %q", result)
+	}
+}
+
+func TestFormatToolInput_InvalidJSON(t *testing.T) {
+	result := formatToolInput(json.RawMessage(`not json`), 80)
+	if result != "not json" {
+		t.Errorf("expected raw input back, got %q", result)
+	}
+}
+
+// ── renderConversation with tool details ──
+
+func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
+	entries := []Entry{
+		{
+			Type: "assistant",
+			Parsed: &ParsedMessage{
+				Role: "assistant",
+				Content: mustMarshal([]ContentBlock{
+					{Type: "tool_use", Name: "Bash", Input: json.RawMessage(`{"command":"ls -la"}`)},
+					{Type: "text", Text: "done"},
+				}),
+			},
+		},
+	}
+
+	// Without tool details
+	linesOff := renderConversation(entries, 80, false)
+	foundDetailOff := false
+	for _, l := range linesOff {
+		if strings.Contains(l, "command") {
+			foundDetailOff = true
+		}
+	}
+	if foundDetailOff {
+		t.Error("tool details should be hidden when showToolDetails=false")
+	}
+
+	// With tool details
+	linesOn := renderConversation(entries, 80, true)
+	foundDetailOn := false
+	for _, l := range linesOn {
+		if strings.Contains(l, "command") {
+			foundDetailOn = true
+		}
+	}
+	if !foundDetailOn {
+		t.Error("tool details should be visible when showToolDetails=true")
+	}
+}
+
+// mustMarshal is a test helper that marshals to JSON or panics.
+func mustMarshal(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

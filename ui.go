@@ -95,8 +95,9 @@ type model struct {
 	contentPath   string
 	contentKind   string
 
-	directFile string
-	err        error
+	directFile    string
+	directProject string // -project flag: auto-open this project after Level 0
+	err           error
 	statusMsg  string
 
 	// Export overlay
@@ -116,6 +117,9 @@ type model struct {
 	contentMatchIdx     int    // current match index
 	contentSearchQuery  string // for highlighting
 	contentSearchGen    int    // debounce generation
+
+	// Tool detail toggle
+	showToolDetails bool
 
 	// Session search overlay
 	sessionSearch       sessionSearchState
@@ -295,18 +299,19 @@ var (
 
 // ── Init ──
 
-func newModel(directFile string, providers []Provider) model {
+func newModel(directFile, directProject string, providers []Provider) model {
 	return model{
-		state:      viewLoading,
-		directFile: directFile,
-		providers:  providers,
+		state:         viewLoading,
+		directFile:    directFile,
+		directProject: directProject,
+		providers:     providers,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	debugLog("Init: providers=%d", len(m.providers))
 	if m.directFile != "" {
-		return loadConvCmd(m.directFile, m.directFile, 120, nil)
+		return loadConvCmd(m.directFile, m.directFile, 120, nil, false)
 	}
 	return m.loadAllProjectListsCmd()
 }
@@ -360,7 +365,7 @@ func loadHistoryTitlesCmd() tea.Cmd {
 	}
 }
 
-func loadConvCmd(path, title string, width int, provider Provider) tea.Cmd {
+func loadConvCmd(path, title string, width int, provider Provider, showToolDetails bool) tea.Cmd {
 	return func() tea.Msg {
 		var entries []Entry
 		var err error
@@ -372,7 +377,7 @@ func loadConvCmd(path, title string, width int, provider Provider) tea.Cmd {
 		if err != nil {
 			return contentLoadedMsg{nil, title, path, "conversation", err}
 		}
-		lines := renderConversation(entries, width)
+		lines := renderConversation(entries, width, showToolDetails)
 		return contentLoadedMsg{lines, title, path, "conversation", nil}
 	}
 }
@@ -483,7 +488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.state == viewProjectDetail && m.contentPath != "" && m.contentKind == "conversation" && oldW != msg.Width {
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails)
 		}
 		return m, nil
 
@@ -599,6 +604,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, loadProjectMetaCmd(i, prov, tree))
 			}
 		}
+
+		// If -project was specified, find and auto-open the matching project
+		if m.directProject != "" {
+			if idx := m.findProjectByName(m.directProject); idx >= 0 {
+				m.projCursor = idx
+				cmd := m.openProject(idx)
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				m.directProject = "" // consumed
+			} else {
+				m.statusMsg = fmt.Sprintf("No project matching %q", m.directProject)
+				m.directProject = ""
+			}
+		}
+
 		return m, tea.Batch(cmds...)
 
 	case projectMetaReadyMsg:
@@ -710,7 +731,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If project detail is loaded, also load the conversation
 		if !m.projectDetailLoading {
 			_, rw := m.paneWidths()
-			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider))
+			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider, m.showToolDetails))
 		}
 		return m, cmd
 
@@ -899,6 +920,33 @@ func (m *model) openProject(idx int) tea.Cmd {
 	)
 }
 
+// findProjectByName finds a project index by exact dir name, display name, or case-insensitive substring.
+func (m *model) findProjectByName(name string) int {
+	if m.tree == nil {
+		return -1
+	}
+	lower := strings.ToLower(name)
+	// 1. Exact DirName match
+	for i, p := range m.tree.Projects {
+		if p.DirName == name {
+			return i
+		}
+	}
+	// 2. Exact DisplayName match
+	for i, p := range m.tree.Projects {
+		if p.DisplayName == name {
+			return i
+		}
+	}
+	// 3. Case-insensitive substring on DirName
+	for i, p := range m.tree.Projects {
+		if strings.Contains(strings.ToLower(p.DirName), lower) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	_, rightW := m.paneWidths()
 
@@ -949,11 +997,11 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails)
 			case "subagent":
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails)
 			case "file":
 				m.contentTitle = item.label
 				m.contentLines = nil
@@ -1075,6 +1123,13 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.contentPath != "" && m.contentKind == "conversation" {
 			m.initExportOverlay(m.contentPath, m.contentTitle)
 			return m, nil
+		}
+	case "t":
+		// Toggle tool call detail
+		if m.contentKind == "conversation" {
+			m.showToolDetails = !m.showToolDetails
+			_, rw := m.paneWidths()
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails)
 		}
 	case "o":
 		if m.contentPath != "" {
@@ -2558,7 +2613,7 @@ func (m model) renderStatus() string {
 
 // ── Conversation rendering ──
 
-func renderConversation(entries []Entry, width int) []string {
+func renderConversation(entries []Entry, width int, showToolDetails bool) []string {
 	contentWidth := width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -2653,6 +2708,12 @@ func renderConversation(entries []Entry, width int) []string {
 					fullLine := fmt.Sprintf("  [tool] %s", summary)
 					for _, wl := range wrapLine(fullLine, contentWidth, 11) {
 						lines = append(lines, toolStyle.Render(wl))
+					}
+					if showToolDetails && len(b.Input) > 0 {
+						detail := formatToolInput(b.Input, contentWidth-4)
+						for _, dl := range strings.Split(detail, "\n") {
+							lines = append(lines, dimStyle.Render("    "+dl))
+						}
 					}
 				}
 			}

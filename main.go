@@ -22,6 +22,7 @@ func debugLog(format string, args ...any) {
 func main() {
 	exportPath := flag.String("export", "", "Export conversation to HTML file")
 	filePath := flag.String("file", "", "Path to a specific JSONL conversation file")
+	projectName := flag.String("project", "", "Jump directly to a project by name (dir name or partial match)")
 	web := flag.Bool("web", false, "Start web server for interactive browsing")
 	port := flag.Int("port", 3333, "Port for web server (used with --web)")
 	debugLog := flag.String("debug", "", "Write debug timing logs to this file")
@@ -88,7 +89,7 @@ func main() {
 	}
 
 	// Interactive TUI mode
-	p := tea.NewProgram(newModel(*filePath, providers))
+	p := tea.NewProgram(newModel(*filePath, *projectName, providers))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
