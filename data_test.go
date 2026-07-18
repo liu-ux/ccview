@@ -502,7 +502,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// Without tool details
-	linesOff := renderConversation(entries, 80, false)
+	linesOff := renderConversation(entries, 80, false, false, false)
 	foundDetailOff := false
 	for _, l := range linesOff {
 		if strings.Contains(l, "command") {
@@ -514,7 +514,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// With tool details
-	linesOn := renderConversation(entries, 80, true)
+	linesOn := renderConversation(entries, 80, true, false, false)
 	foundDetailOn := false
 	for _, l := range linesOn {
 		if strings.Contains(l, "command") {
@@ -523,6 +523,106 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 	if !foundDetailOn {
 		t.Error("tool details should be visible when showToolDetails=true")
+	}
+}
+
+// ── matchConversation ──
+
+func TestMatchConversation_Title(t *testing.T) {
+	conv := TreeConversation{Title: "Fix login bug", Preview: "something else"}
+	if !matchConversation(conv, "", "login") {
+		t.Error("should match title")
+	}
+}
+
+func TestMatchConversation_Preview(t *testing.T) {
+	conv := TreeConversation{Title: "", Preview: "Added error handling"}
+	if !matchConversation(conv, "", "error") {
+		t.Error("should match preview")
+	}
+}
+
+func TestMatchConversation_ProjectName(t *testing.T) {
+	conv := TreeConversation{Title: "", Preview: ""}
+	if !matchConversation(conv, "my-app", "app") {
+		t.Error("should match project name")
+	}
+}
+
+func TestMatchConversation_CaseInsensitive(t *testing.T) {
+	conv := TreeConversation{Title: "Fix Login Bug"}
+	if !matchConversation(conv, "", "login") {
+		t.Error("should match case-insensitively")
+	}
+}
+
+func TestMatchConversation_NoMatch(t *testing.T) {
+	conv := TreeConversation{Title: "Fix login bug", Preview: "auth fix"}
+	if matchConversation(conv, "myapp", "deploy") {
+		t.Error("should not match unrelated query")
+	}
+}
+
+// ── buildSidebar with filter ──
+
+func TestBuildSidebar_FilterApplied(t *testing.T) {
+	proj := &TreeProject{
+		Conversations: []TreeConversation{
+			{Path: "/a.jsonl", Title: "Conv A", ModTime: "2024-01-01T00:00:00Z"},
+			{Path: "/b.jsonl", Title: "Conv B", ModTime: "2024-01-02T00:00:00Z"},
+			{Path: "/c.jsonl", Title: "Conv C", ModTime: "2024-01-03T00:00:00Z"},
+		},
+	}
+	// Filter to only show Conv B
+	filter := map[string]bool{"/b.jsonl": true}
+	items := buildSidebar(proj, nil, "", filter)
+
+	convCount := 0
+	for _, item := range items {
+		if item.kind == "conversation" {
+			convCount++
+			if item.path != "/b.jsonl" {
+				t.Errorf("filtered sidebar should only contain /b.jsonl, got %s", item.path)
+			}
+		}
+	}
+	if convCount != 1 {
+		t.Errorf("expected 1 conversation in filtered sidebar, got %d", convCount)
+	}
+}
+
+func TestBuildSidebar_NilFilterShowsAll(t *testing.T) {
+	proj := &TreeProject{
+		Conversations: []TreeConversation{
+			{Path: "/a.jsonl", Title: "Conv A", ModTime: "2024-01-01T00:00:00Z"},
+			{Path: "/b.jsonl", Title: "Conv B", ModTime: "2024-01-02T00:00:00Z"},
+		},
+	}
+	items := buildSidebar(proj, nil, "", nil)
+
+	convCount := 0
+	for _, item := range items {
+		if item.kind == "conversation" {
+			convCount++
+		}
+	}
+	if convCount != 2 {
+		t.Errorf("expected 2 conversations with nil filter, got %d", convCount)
+	}
+}
+
+// ── SearchResult enrichment ──
+
+func TestSearchResult_HasMsgCountAndCWD(t *testing.T) {
+	r := SearchResult{
+		MsgCount: 42,
+		CWD:      "/home/user/project",
+	}
+	if r.MsgCount != 42 {
+		t.Errorf("expected MsgCount=42, got %d", r.MsgCount)
+	}
+	if r.CWD != "/home/user/project" {
+		t.Errorf("expected CWD=/home/user/project, got %s", r.CWD)
 	}
 }
 

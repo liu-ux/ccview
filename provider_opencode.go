@@ -497,7 +497,7 @@ func capitalizeToolName(name string) string {
 	return name
 }
 
-func (p *OpenCodeProvider) SearchSessions(query, projectID string) []SearchResult {
+func (p *OpenCodeProvider) ContentSearch(query string, projectID string) []SearchResult {
 	db, err := p.openDB()
 	if err != nil {
 		return nil
@@ -509,24 +509,28 @@ func (p *OpenCodeProvider) SearchSessions(query, projectID string) []SearchResul
 
 	if projectID != "" {
 		rows, err = db.Query(`
-			SELECT s.id, s.title, s.slug, s.directory, s.time_updated, p.worktree, p.name
-			FROM session s
+			SELECT DISTINCT s.id, s.title, p.worktree, p.name, s.time_updated
+			FROM part pt
+			JOIN message m ON pt.message_id = m.id
+			JOIN session s ON m.session_id = s.id
 			JOIN project p ON s.project_id = p.id
 			WHERE s.project_id = ? AND s.parent_id IS NULL AND s.time_archived IS NULL
-			  AND (s.title LIKE ? OR s.slug LIKE ?)
+			  AND pt.data LIKE ?
 			ORDER BY s.time_updated DESC
 			LIMIT 50
-		`, projectID, q, q)
+		`, projectID, q)
 	} else {
 		rows, err = db.Query(`
-			SELECT s.id, s.title, s.slug, s.directory, s.time_updated, p.worktree, p.name
-			FROM session s
+			SELECT DISTINCT s.id, s.title, p.worktree, p.name, s.time_updated
+			FROM part pt
+			JOIN message m ON pt.message_id = m.id
+			JOIN session s ON m.session_id = s.id
 			JOIN project p ON s.project_id = p.id
 			WHERE s.parent_id IS NULL AND s.time_archived IS NULL
-			  AND (s.title LIKE ? OR s.slug LIKE ? OR p.worktree LIKE ?)
+			  AND pt.data LIKE ?
 			ORDER BY s.time_updated DESC
 			LIMIT 50
-		`, q, q, q)
+		`, q)
 	}
 	if err != nil {
 		return nil
@@ -536,12 +540,12 @@ func (p *OpenCodeProvider) SearchSessions(query, projectID string) []SearchResul
 	var results []SearchResult
 	for rows.Next() {
 		var (
-			sid, title, slug, dir string
-			updated               int64
-			worktree              string
-			projName              sql.NullString
+			sid, title string
+			worktree   string
+			projName   sql.NullString
+			updated    int64
 		)
-		if err := rows.Scan(&sid, &title, &slug, &dir, &updated, &worktree, &projName); err != nil {
+		if err := rows.Scan(&sid, &title, &worktree, &projName, &updated); err != nil {
 			continue
 		}
 		displayName := shortenPath(worktree)

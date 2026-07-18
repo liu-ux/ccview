@@ -35,10 +35,6 @@ func (p *ClaudeProvider) LoadTree() (*TreeData, error) {
 	return tree, nil
 }
 
-func (p *ClaudeProvider) LoadConversation(path string) ([]Entry, error) {
-	return parseConversation(path)
-}
-
 func (p *ClaudeProvider) LoadProjectList() (*TreeData, error) {
 	return loadProjectDirs()
 }
@@ -51,34 +47,53 @@ func (p *ClaudeProvider) LoadProjectDetail(ctx context.Context, dirName, dirPath
 	return loadProjectDetail(ctx, dirName, dirPath, historyTitles)
 }
 
-func (p *ClaudeProvider) SearchSessions(query, projectID string) []SearchResult {
-	tree, err := p.LoadTree()
-	if err != nil || tree == nil {
+func (p *ClaudeProvider) LoadConversation(path string) ([]Entry, error) {
+	return parseConversation(path)
+}
+
+func (p *ClaudeProvider) ContentSearch(query string, projectID string) []SearchResult {
+	home, _ := os.UserHomeDir()
+	claudeDir := filepath.Join(home, ".claude")
+	matchedFiles := searchContentInFiles(query, claudeDir)
+	if len(matchedFiles) == 0 {
 		return nil
 	}
-	q := strings.ToLower(query)
+
+	projectsDir := filepath.Join(claudeDir, "projects")
+	projEntries, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return nil
+	}
+
 	var results []SearchResult
-	for i, proj := range tree.Projects {
-		if projectID != "" && proj.DirName != projectID {
+	for _, pe := range projEntries {
+		if !pe.IsDir() {
 			continue
 		}
-		for _, conv := range proj.Conversations {
-			title := strings.ToLower(conv.Title)
-			preview := strings.ToLower(conv.Preview)
-			slug := strings.ToLower(conv.Slug)
-			projName := strings.ToLower(proj.DisplayName)
-			if strings.Contains(title, q) || strings.Contains(preview, q) ||
-				strings.Contains(slug, q) || strings.Contains(projName, q) {
-				results = append(results, SearchResult{
-					Source:      "claude",
-					ProjectName: proj.DisplayName,
-					Title:       conv.Title,
-					Preview:     conv.Preview,
-					Path:        conv.Path,
-					ModTime:     conv.ModTime,
-					ProjIndex:   i,
-				})
+		if projectID != "" && pe.Name() != projectID {
+			continue
+		}
+		projPath := filepath.Join(projectsDir, pe.Name())
+		convEntries, _ := os.ReadDir(projPath)
+		for _, ce := range convEntries {
+			if ce.IsDir() || !strings.HasSuffix(ce.Name(), ".jsonl") {
+				continue
 			}
+			convPath := filepath.Clean(filepath.Join(projPath, ce.Name()))
+			if !matchedFiles[convPath] {
+				continue
+			}
+			sessionID := strings.TrimSuffix(ce.Name(), ".jsonl")
+			title := sessionID
+			if len(title) > 8 {
+				title = title[:8]
+			}
+			results = append(results, SearchResult{
+				Source:      "claude",
+				ProjectName: pe.Name(),
+				Title:       title,
+				Path:        convPath,
+			})
 		}
 	}
 	return results

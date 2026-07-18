@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"os"
@@ -49,13 +50,15 @@ const (
 )
 
 type sessionSearchState struct {
-	active    bool
-	scope     searchScope
-	input     []rune
-	results   []SearchResult
-	cursor    int
-	offset    int
-	gen       int // debounce generation — only the latest tick fires search
+	active        bool
+	scope         searchScope
+	input         []rune
+	results       []SearchResult
+	cursor        int
+	offset        int
+	gen           int  // debounce generation — only the latest tick fires search
+	contentSearch bool // true = search conversation content, false = search metadata only
+	searching     bool // true while rg/grep is running
 }
 
 // ── Model ──
@@ -120,6 +123,11 @@ type model struct {
 
 	// Tool detail toggle
 	showToolDetails bool
+	showToolResults bool // toggle tool_result display
+	showThinking    bool // toggle thinking block display
+
+	// Sidebar filter (from search results)
+	sidebarFilter map[string]bool // conversation paths to show; nil = show all
 
 	// Session search overlay
 	sessionSearch       sessionSearchState
@@ -218,6 +226,11 @@ type historyTitlesLoadedMsg struct {
 	titles map[string]string
 }
 
+type contentSearchDoneMsg struct {
+	gen     int
+	results []SearchResult
+}
+
 // ── Styles ──
 
 var (
@@ -311,7 +324,7 @@ func newModel(directFile, directProject string, providers []Provider) model {
 func (m model) Init() tea.Cmd {
 	debugLog("Init: providers=%d", len(m.providers))
 	if m.directFile != "" {
-		return loadConvCmd(m.directFile, m.directFile, 120, nil, false)
+		return loadConvCmd(m.directFile, m.directFile, 120, nil, false, false, false)
 	}
 	return m.loadAllProjectListsCmd()
 }
@@ -365,7 +378,7 @@ func loadHistoryTitlesCmd() tea.Cmd {
 	}
 }
 
-func loadConvCmd(path, title string, width int, provider Provider, showToolDetails bool) tea.Cmd {
+func loadConvCmd(path, title string, width int, provider Provider, showToolDetails, showToolResults, showThinking bool) tea.Cmd {
 	return func() tea.Msg {
 		var entries []Entry
 		var err error
@@ -377,7 +390,7 @@ func loadConvCmd(path, title string, width int, provider Provider, showToolDetai
 		if err != nil {
 			return contentLoadedMsg{nil, title, path, "conversation", err}
 		}
-		lines := renderConversation(entries, width, showToolDetails)
+		lines := renderConversation(entries, width, showToolDetails, showToolResults, showThinking)
 		return contentLoadedMsg{lines, title, path, "conversation", nil}
 	}
 }
@@ -398,7 +411,7 @@ func loadFileCmd(path, title string, width int) tea.Cmd {
 
 // ── Sidebar builder ──
 
-func buildSidebar(proj *TreeProject, plans []TreeFileRef, expandedConvPath string) []sidebarItem {
+func buildSidebar(proj *TreeProject, plans []TreeFileRef, expandedConvPath string, filter map[string]bool) []sidebarItem {
 	items := []sidebarItem{
 		{kind: "back", label: "< Back to Projects"},
 		{kind: "separator"},
@@ -424,6 +437,10 @@ func buildSidebar(proj *TreeProject, plans []TreeFileRef, expandedConvPath strin
 	}
 
 	for _, conv := range proj.Conversations {
+		// Apply sidebar filter if active
+		if filter != nil && !filter[conv.Path] {
+			continue
+		}
 		title := conv.Title
 		if title == "" {
 			title = conv.Slug
@@ -488,7 +505,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.state == viewProjectDetail && m.contentPath != "" && m.contentKind == "conversation" && oldW != msg.Width {
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
 		}
 		return m, nil
 
@@ -657,7 +674,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// If this is the currently viewed project, rebuild sidebar
 				if m.currentProj != nil && m.currentProj.DirName == msg.proj.DirName {
 					m.currentProj = &tree.Projects[msg.projIdx]
-					m.sidebar = buildSidebar(m.currentProj, tree.Plans, m.expandedConvPath)
+					m.sidebar = buildSidebar(m.currentProj, tree.Plans, m.expandedConvPath, m.sidebarFilter)
 					m.sidebarCursor = 0
 					if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
 						m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
@@ -671,6 +688,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case historyTitlesLoadedMsg:
 		debugLog("historyTitlesLoadedMsg: %d titles", len(msg.titles))
 		m.historyTitles = msg.titles
+		return m, nil
+
+	case contentSearchDoneMsg:
+		// Async content search completed
+		if msg.gen == m.sessionSearch.gen {
+			m.sessionSearch.results = msg.results
+		}
+		m.sessionSearch.searching = false
 		return m, nil
 
 	case contentLoadedMsg:
@@ -698,6 +723,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		if msg.kind == "session" && msg.gen == m.sessionSearch.gen {
+			// Content search uses rg/grep which may be slow — run async
+			if m.sessionSearch.contentSearch {
+				m.sessionSearch.searching = true
+				gen := msg.gen
+				query := string(m.sessionSearch.input)
+				scope := m.sessionSearch.scope
+				// Pass providers for the goroutine to search with
+				providers := m.providers
+				var currentDirName string
+				if m.currentProj != nil {
+					currentDirName = m.currentProj.DirName
+				}
+				tabIdx := m.providerTab
+				return m, func() tea.Msg {
+					results := computeContentSearchResults(query, scope, providers, tabIdx, currentDirName)
+					return contentSearchDoneMsg{gen: gen, results: results}
+				}
+			}
 			m.computeSessionSearchResults()
 		}
 		return m, nil
@@ -731,7 +774,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If project detail is loaded, also load the conversation
 		if !m.projectDetailLoading {
 			_, rw := m.paneWidths()
-			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider, m.showToolDetails))
+			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking))
 		}
 		return m, cmd
 
@@ -887,7 +930,7 @@ func (m *model) openProject(idx int) tea.Cmd {
 
 	// If conversations are already loaded (Level 2 done), build sidebar immediately
 	if len(m.currentProj.Conversations) > 0 {
-		m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
+		m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath, m.sidebarFilter)
 		m.sidebarCursor = 0
 		if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
 			m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
@@ -954,6 +997,16 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "esc", "backspace", "h", "left":
+		// Clear sidebar filter if active, otherwise go back
+		if m.sidebarFilter != nil {
+			m.sidebarFilter = nil
+			m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath, nil)
+			m.sidebarCursor = 0
+			if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
+				m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
+			}
+			return m, nil
+		}
 		m.state = viewProjectList
 		m.currentProj = nil
 		m.sidebar = nil
@@ -987,7 +1040,7 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "conversation":
 				m.expandedConvPath = item.path
-				m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath)
+				m.sidebar = buildSidebar(m.currentProj, m.tree.Plans, m.expandedConvPath, m.sidebarFilter)
 				// Find cursor for the expanded conversation
 				for i, si := range m.sidebar {
 					if si.path == item.path && si.kind == "conversation" {
@@ -997,11 +1050,11 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
 			case "subagent":
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
 			case "file":
 				m.contentTitle = item.label
 				m.contentLines = nil
@@ -1129,7 +1182,21 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.contentKind == "conversation" {
 			m.showToolDetails = !m.showToolDetails
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+		}
+	case "T":
+		// Toggle thinking block display
+		if m.contentKind == "conversation" {
+			m.showThinking = !m.showThinking
+			_, rw := m.paneWidths()
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+		}
+	case "R":
+		// Toggle tool result display
+		if m.contentKind == "conversation" {
+			m.showToolResults = !m.showToolResults
+			_, rw := m.paneWidths()
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
 		}
 	case "o":
 		if m.contentPath != "" {
@@ -1247,20 +1314,51 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "tab":
-		// Toggle scope — immediate recompute since it's just re-filtering
-		if m.sessionSearch.scope == searchScopeProject {
-			m.sessionSearch.scope = searchScopeGlobal
-		} else {
+		// Toggle scope: global ↔ project
+		if m.sessionSearch.scope == searchScopeGlobal {
 			m.sessionSearch.scope = searchScopeProject
+		} else {
+			m.sessionSearch.scope = searchScopeGlobal
 		}
 		m.sessionSearch.gen++
-		m.computeSessionSearchResults()
-		return m, nil
-	case "up", "k":
+		return m, m.sessionSearchDebounceCmd()
+	case "alt+t":
+		// Switch to title search mode
+		m.sessionSearch.contentSearch = false
+		m.sessionSearch.gen++
+		return m, m.sessionSearchDebounceCmd()
+	case "alt+c":
+		// Switch to content search mode
+		m.sessionSearch.contentSearch = true
+		m.sessionSearch.gen++
+		return m, m.sessionSearchDebounceCmd()
+	case "f":
+		// Apply sidebar filter from search results
+		if len(m.sessionSearch.results) > 0 {
+			m.sidebarFilter = make(map[string]bool)
+			for _, r := range m.sessionSearch.results {
+				m.sidebarFilter[r.Path] = true
+			}
+			m.sessionSearch.active = false
+			m.activePane = paneSidebar
+			// Rebuild sidebar with filter
+			if m.currentProj != nil {
+				tree := m.providerTrees[m.providerTab]
+				if tree != nil {
+					m.sidebar = buildSidebar(m.currentProj, tree.Plans, m.expandedConvPath, m.sidebarFilter)
+					m.sidebarCursor = 0
+					if len(m.sidebar) > 0 && !m.sidebar[0].navigable() {
+						m.sidebarCursor = nextNavigable(m.sidebar, -1, 1)
+					}
+				}
+			}
+			return m, nil
+		}
+	case "up":
 		if m.sessionSearch.cursor > 0 {
 			m.sessionSearch.cursor--
 		}
-	case "down", "j":
+	case "down":
 		if m.sessionSearch.cursor < len(m.sessionSearch.results)-1 {
 			m.sessionSearch.cursor++
 		}
@@ -1307,18 +1405,100 @@ func (m *model) computeSessionSearchResults() {
 		return
 	}
 
+	q := strings.ToLower(query)
 	var allResults []SearchResult
+
+	// Content search mode: use rg/grep to find matching files
+	if m.sessionSearch.contentSearch {
+		home, _ := os.UserHomeDir()
+		claudeDir := filepath.Join(home, ".claude")
+		matchedFiles := searchContentInFiles(query, claudeDir)
+		if matchedFiles != nil {
+			for pi, tree := range m.providerTrees {
+				if tree == nil {
+					continue
+				}
+				for i, proj := range tree.Projects {
+					if m.sessionSearch.scope == searchScopeProject && m.currentProj != nil && proj.DirName != m.currentProj.DirName {
+						continue
+					}
+					for _, conv := range proj.Conversations {
+						if matchedFiles[conv.Path] {
+							allResults = append(allResults, SearchResult{
+								Source:      proj.Source,
+								ProjectName: proj.DisplayName,
+								Title:       conv.Title,
+								Preview:     conv.Preview,
+								Path:        conv.Path,
+								ModTime:     conv.ModTime,
+								ProjIndex:   i,
+								MsgCount:    conv.MsgCount,
+								CWD:         conv.CWD,
+							})
+						}
+					}
+					_ = pi
+				}
+			}
+		}
+		sortSearchResults(allResults)
+		if len(allResults) > 50 {
+			allResults = allResults[:50]
+		}
+		m.sessionSearch.results = allResults
+		return
+	}
+
+	// Metadata search mode: search title/preview/slug/project name
 	if m.sessionSearch.scope == searchScopeProject && m.currentProj != nil {
-		// Project scope: only search current provider's project
-		if m.currentProvider != nil {
-			results := m.currentProvider.SearchSessions(query, m.currentProj.DirName)
-			allResults = append(allResults, results...)
+		// Project scope: search current project's conversations in the cached tree
+		tree := m.providerTrees[m.providerTab]
+		if tree != nil {
+			for i, proj := range tree.Projects {
+				if proj.DirName != m.currentProj.DirName {
+					continue
+				}
+				for _, conv := range proj.Conversations {
+					if matchConversation(conv, proj.DisplayName, q) {
+						allResults = append(allResults, SearchResult{
+							Source:      proj.Source,
+							ProjectName: proj.DisplayName,
+							Title:       conv.Title,
+							Preview:     conv.Preview,
+							Path:        conv.Path,
+							ModTime:     conv.ModTime,
+							ProjIndex:   i,
+							MsgCount:    conv.MsgCount,
+							CWD:         conv.CWD,
+						})
+					}
+				}
+			}
 		}
 	} else {
-		// Global scope: search all providers
-		for _, prov := range m.providers {
-			results := prov.SearchSessions(query, "")
-			allResults = append(allResults, results...)
+		// Global scope: search all provider trees
+		for pi, tree := range m.providerTrees {
+			if tree == nil {
+				continue
+			}
+			for i, proj := range tree.Projects {
+				for _, conv := range proj.Conversations {
+					if matchConversation(conv, proj.DisplayName, q) {
+						allResults = append(allResults, SearchResult{
+							Source:      proj.Source,
+							ProjectName: proj.DisplayName,
+							Title:       conv.Title,
+							Preview:     conv.Preview,
+							Path:        conv.Path,
+							ModTime:     conv.ModTime,
+							ProjIndex:   i,
+							MsgCount:    conv.MsgCount,
+							CWD:         conv.CWD,
+						})
+					}
+				}
+				_ = pi // used for future provider index tracking
+			}
 		}
 	}
 	sortSearchResults(allResults)
@@ -1328,6 +1508,100 @@ func (m *model) computeSessionSearchResults() {
 		allResults = allResults[:50]
 	}
 	m.sessionSearch.results = allResults
+}
+
+// computeContentSearchResults runs content search via providers (called from async goroutine).
+func computeContentSearchResults(query string, scope searchScope, providers []Provider, tabIdx int, currentDirName string) []SearchResult {
+	var allResults []SearchResult
+	for _, prov := range providers {
+		projectID := ""
+		if scope == searchScopeProject && currentDirName != "" {
+			projectID = currentDirName
+		}
+		results := prov.ContentSearch(query, projectID)
+		allResults = append(allResults, results...)
+	}
+
+	sortSearchResults(allResults)
+	if len(allResults) > 50 {
+		allResults = allResults[:50]
+	}
+	return allResults
+}
+
+// matchConversation checks if a conversation matches the search query against metadata fields.
+func matchConversation(conv TreeConversation, projName, q string) bool {
+	title := strings.ToLower(conv.Title)
+	preview := strings.ToLower(conv.Preview)
+	slug := strings.ToLower(conv.Slug)
+	pname := strings.ToLower(projName)
+	return strings.Contains(title, q) || strings.Contains(preview, q) ||
+		strings.Contains(slug, q) || strings.Contains(pname, q)
+}
+
+// searchContentInFiles searches for query in JSONL files using rg or grep.
+// Returns a set of absolute file paths (using filepath.Clean) that contain the query.
+func searchContentInFiles(query string, claudeDir string) map[string]bool {
+	matches := make(map[string]bool)
+	searchDir := filepath.Join(claudeDir, "projects")
+
+	// Try rg first, then grep
+	if rgPath, err := exec.LookPath("rg"); err == nil {
+		cmd := exec.Command(rgPath, "-l", query, searchDir)
+		out, err := cmd.Output()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line == "" {
+					continue
+				}
+				if !filepath.IsAbs(line) {
+					line = filepath.Join(searchDir, line)
+				}
+				matches[filepath.Clean(line)] = true
+			}
+			return matches
+		}
+	}
+
+	if grepPath, err := exec.LookPath("grep"); err == nil {
+		cmd := exec.Command(grepPath, "-rl", query, searchDir)
+		out, err := cmd.Output()
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if line == "" {
+					continue
+				}
+				if !filepath.IsAbs(line) {
+					line = filepath.Join(searchDir, line)
+				}
+				matches[filepath.Clean(line)] = true
+			}
+			return matches
+		}
+	}
+
+	// Manual fallback: walk projects dir and scan each JSONL file
+	q := strings.ToLower(query)
+	filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			return nil
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 0), 1024*1024)
+		for scanner.Scan() {
+			if strings.Contains(strings.ToLower(scanner.Text()), q) {
+				matches[filepath.Clean(path)] = true
+				break
+			}
+		}
+		return nil
+	})
+	return matches
 }
 
 func (m model) navigateToSearchResult(result SearchResult) tea.Cmd {
@@ -1388,8 +1662,12 @@ func (m model) renderSessionSearchOverlay() string {
 	if m.sessionSearch.scope == searchScopeProject {
 		scopeLabel = "project"
 	}
+	modeLabel := "title"
+	if m.sessionSearch.contentSearch {
+		modeLabel = "content"
+	}
 	inputLine := fmt.Sprintf(" /%s", query+"\u2588")
-	scopeBadge := dimStyle.Render(fmt.Sprintf("[%s]", scopeLabel))
+	scopeBadge := dimStyle.Render(fmt.Sprintf("[%s %s]", modeLabel, scopeLabel))
 	gap := innerW - lipgloss.Width(inputLine) - lipgloss.Width(scopeBadge)
 	if gap < 1 {
 		gap = 1
@@ -1402,7 +1680,9 @@ func (m model) renderSessionSearchOverlay() string {
 	if maxVisible < 3 {
 		maxVisible = 3
 	}
-	if len(m.sessionSearch.results) == 0 {
+	if m.sessionSearch.searching {
+		lines = append(lines, dimStyle.Render(" Searching..."))
+	} else if len(m.sessionSearch.results) == 0 {
 		if len(query) > 0 {
 			lines = append(lines, dimStyle.Render(" No matches found"))
 		} else {
@@ -1425,7 +1705,15 @@ func (m model) renderSessionSearchOverlay() string {
 
 			title := r.Title
 			dateStr := formatDateSmart(r.ModTime)
-			rightPart := fmt.Sprintf(" %s %s", srcBadge, dateStr)
+			msgInfo := ""
+			if r.MsgCount > 0 {
+				msgInfo = fmt.Sprintf(" %d msgs", r.MsgCount)
+			}
+			cwdInfo := ""
+			if r.CWD != "" {
+				cwdInfo = " " + shortenPath(r.CWD)
+			}
+			rightPart := fmt.Sprintf(" %s%s%s", srcBadge, msgInfo, dateStr)
 			maxTitle := innerW - lipgloss.Width(rightPart) - 4
 			if maxTitle < 10 {
 				maxTitle = 10
@@ -1447,16 +1735,24 @@ func (m model) renderSessionSearchOverlay() string {
 				lines = append(lines, truncTo(entryLine, innerW))
 			}
 
-			// Show project name on second line for current selection
-			if isCur && r.ProjectName != "" {
-				lines = append(lines, dimStyle.Render("   "+r.ProjectName))
+			// Show project name and CWD on second line for current selection
+			if isCur && (r.ProjectName != "" || cwdInfo != "") {
+				subLine := r.ProjectName
+				if cwdInfo != "" {
+					if subLine != "" {
+						subLine += "  " + cwdInfo
+					} else {
+						subLine = cwdInfo
+					}
+				}
+				lines = append(lines, dimStyle.Render("   "+subLine))
 			}
 		}
 	}
 
 	lines = append(lines, "")
 	resultCount := len(m.sessionSearch.results)
-	hint := fmt.Sprintf(" %d results  enter:open  tab:scope  esc:close", resultCount)
+	hint := fmt.Sprintf(" %d results  ↑↓:navigate  enter:open  f:filter  alt+t:title  alt+c:content  tab:scope  esc:close", resultCount)
 	lines = append(lines, dimStyle.Render(hint))
 
 	overlayBox := lipgloss.NewStyle().
@@ -2590,6 +2886,9 @@ func (m model) renderStatus() string {
 			statusHighlight.Render("sidebar")+statusStyle.Render("/viewer"),
 			"enter:open", "o:editor", "esc:back", "tab:viewer", "e:export", "/:search", "q:quit",
 		)
+		if m.sidebarFilter != nil {
+			parts = append(parts, statusHighlight.Render("filtered (esc:clear)"))
+		}
 	} else {
 		parts = append(parts,
 			statusStyle.Render("sidebar/")+statusHighlight.Render("viewer"),
@@ -2606,14 +2905,14 @@ func (m model) renderStatus() string {
 		if len(m.contentMatches) > 0 {
 			parts = append(parts, fmt.Sprintf("%d/%d", m.contentMatchIdx+1, len(m.contentMatches)))
 		}
-		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "t:tools", "tab:sidebar", "e:export", "q:quit")
+		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "t:tools", "T:think", "R:result", "tab:sidebar", "e:export", "q:quit")
 	}
 	return statusStyle.Render(" " + strings.Join(parts, "  "))
 }
 
 // ── Conversation rendering ──
 
-func renderConversation(entries []Entry, width int, showToolDetails bool) []string {
+func renderConversation(entries []Entry, width int, showToolDetails bool, showToolResults bool, showThinking bool) []string {
 	contentWidth := width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -2621,6 +2920,26 @@ func renderConversation(entries []Entry, width int, showToolDetails bool) []stri
 
 	var lines []string
 	sep := faintStyle.Render(strings.Repeat("\u2500", width))
+
+	// Pre-pass: collect tool results by tool_use_id for inline matching
+	toolResults := make(map[string]string)
+	for _, entry := range entries {
+		if entry.Type != "user" || entry.Parsed == nil {
+			continue
+		}
+		for _, b := range getContentBlocks(entry.Parsed) {
+			if b.Type == "tool_result" && b.ToolUseID != "" {
+				resultText := b.Text
+				if resultText == "" {
+					resultText = b.Content
+				}
+				if resultText != "" {
+					toolResults[b.ToolUseID] = resultText
+				}
+			}
+		}
+	}
+	renderedResults := make(map[string]bool)
 
 	for _, entry := range entries {
 		switch entry.Type {
@@ -2630,14 +2949,42 @@ func renderConversation(entries []Entry, width int, showToolDetails bool) []stri
 			}
 			blocks := getContentBlocks(entry.Parsed)
 			isToolResult := false
+			allInline := true
 			for _, b := range blocks {
 				if b.Type == "tool_result" {
 					isToolResult = true
-					break
+					if !renderedResults[b.ToolUseID] {
+						allInline = false
+					}
 				}
 			}
 			if isToolResult {
-				lines = append(lines, toolResultStyle.Render("  [result] returned"))
+				// Skip if all results were already rendered inline with tool calls
+				if allInline {
+					continue
+				}
+				// Show orphaned results (no matching tool_use in a previous assistant message)
+				for _, b := range blocks {
+					if b.Type != "tool_result" || renderedResults[b.ToolUseID] {
+						continue
+					}
+					resultText := b.Text
+					if resultText == "" {
+						resultText = b.Content
+					}
+					if resultText == "" {
+						continue
+					}
+					if showToolResults {
+						lines = append(lines, toolResultStyle.Render("  [result]"))
+						rendered := renderMarkdownTerm(resultText, contentWidth-4)
+						for _, rl := range strings.Split(rendered, "\n") {
+							lines = append(lines, dimStyle.Render("  "+rl))
+						}
+					} else {
+						lines = append(lines, toolResultStyle.Render("  [result] returned  (R to expand)"))
+					}
+				}
 				continue
 			}
 
@@ -2675,20 +3022,27 @@ func renderConversation(entries []Entry, width int, showToolDetails bool) []stri
 						continue
 					}
 					thinkLines := strings.Split(b.Thinking, "\n")
-					show := 3
-					prefix := "  [thinking] "
-					contIndent := 15
-					if len(thinkLines) > show {
-						for i := 0; i < show; i++ {
-							for _, wl := range wrapLine(prefix+thinkLines[i], contentWidth, contIndent) {
-								lines = append(lines, thinkingStyle.Render(wl))
+					contIndent := 2
+					if showThinking {
+						for _, tl := range thinkLines {
+							for _, wl := range wrapLine(tl, contentWidth-4, contIndent) {
+								lines = append(lines, thinkingStyle.Render("  "+wl))
 							}
 						}
-						lines = append(lines, thinkingStyle.Render(fmt.Sprintf("  ... (%d more lines)", len(thinkLines)-show)))
 					} else {
-						for _, tl := range thinkLines {
-							for _, wl := range wrapLine(prefix+tl, contentWidth, contIndent) {
-								lines = append(lines, thinkingStyle.Render(wl))
+						show := 1
+						if len(thinkLines) > show {
+							for i := 0; i < show; i++ {
+								for _, wl := range wrapLine(thinkLines[i], contentWidth-4, contIndent) {
+									lines = append(lines, thinkingStyle.Render("  "+wl))
+								}
+							}
+							lines = append(lines, dimStyle.Render(fmt.Sprintf("  ... (%d more lines, T to expand)", len(thinkLines)-show)))
+						} else {
+							for _, tl := range thinkLines {
+								for _, wl := range wrapLine(tl, contentWidth-4, contIndent) {
+									lines = append(lines, thinkingStyle.Render("  "+wl))
+								}
 							}
 						}
 					}
@@ -2713,6 +3067,19 @@ func renderConversation(entries []Entry, width int, showToolDetails bool) []stri
 						detail := formatToolInput(b.Input, contentWidth-4)
 						for _, dl := range strings.Split(detail, "\n") {
 							lines = append(lines, dimStyle.Render("    "+dl))
+						}
+					}
+					// Render matched result inline
+					if result, ok := toolResults[b.ID]; ok {
+						renderedResults[b.ID] = true
+						if showToolResults {
+							for _, rl := range strings.Split(result, "\n") {
+								for _, wl := range wrapLine(rl, contentWidth-6, 4) {
+									lines = append(lines, dimStyle.Render("    "+wl))
+								}
+							}
+						} else {
+							lines = append(lines, dimStyle.Render("    (R to expand result)"))
 						}
 					}
 				}

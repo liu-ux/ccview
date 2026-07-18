@@ -17,8 +17,9 @@ type Provider interface {
 	LoadProjectDetail(ctx context.Context, dirName, dirPath string, historyTitles map[string]string) *TreeProject
 	// LoadConversation loads a single conversation's entries.
 	LoadConversation(path string) ([]Entry, error)
-	// SearchSessions searches across sessions.
-	SearchSessions(query, projectID string) []SearchResult
+	// ContentSearch searches within conversation content.
+	// For Claude: uses rg/grep on filesystem. For OpenCode: uses SQL on database.
+	ContentSearch(query string, projectID string) []SearchResult
 }
 
 // SearchResult is a single match from session search.
@@ -30,4 +31,6 @@ type SearchResult struct {
 	Path        string // conversation path or session ID
 	ModTime     string
 	ProjIndex   int // index into provider's tree.Projects
+	MsgCount    int
+	CWD         string
 }

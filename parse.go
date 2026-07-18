@@ -50,6 +50,7 @@ type ContentBlock struct {
 	Type      string          `json:"type"`
 	Text      string          `json:"text"`
 	Thinking  string          `json:"thinking"`
+	Content   string          `json:"content"` // tool_result uses "content" instead of "text"
 	Name      string          `json:"name"`
 	ID        string          `json:"id"`
 	Input     json.RawMessage `json:"input"`
@@ -86,7 +87,49 @@ func parseConversation(path string) ([]Entry, error) {
 		entries = append(entries, entry)
 	}
 
-	return entries, scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return mergeSplitEntries(entries), nil
+}
+
+// mergeSplitEntries merges consecutive assistant entries that share the same
+// message ID. Claude's JSONL sometimes splits a single assistant response
+// (thinking + text + tool_use) across multiple lines with the same MsgID.
+func mergeSplitEntries(entries []Entry) []Entry {
+	if len(entries) == 0 {
+		return entries
+	}
+	var merged []Entry
+	for _, e := range entries {
+		if len(merged) > 0 {
+			prev := &merged[len(merged)-1]
+			if e.Type == "assistant" && prev.Type == "assistant" &&
+				e.Parsed != nil && prev.Parsed != nil &&
+				e.Parsed.MsgID != "" && e.Parsed.MsgID == prev.Parsed.MsgID {
+				// Merge content blocks into the previous entry
+				prevBlocks := getContentBlocks(prev.Parsed)
+				newBlocks := getContentBlocks(e.Parsed)
+				prevBlocks = append(prevBlocks, newBlocks...)
+				contentJSON, _ := json.Marshal(prevBlocks)
+				prev.Parsed.Content = contentJSON
+				// Keep the last non-empty model/usage/stop_reason
+				if e.Parsed.Model != "" {
+					prev.Parsed.Model = e.Parsed.Model
+				}
+				if e.Parsed.Usage != nil {
+					prev.Parsed.Usage = e.Parsed.Usage
+				}
+				if e.Parsed.StopReason != "" {
+					prev.Parsed.StopReason = e.Parsed.StopReason
+				}
+				continue
+			}
+		}
+		merged = append(merged, e)
+	}
+	return merged
 }
 
 // ── Metadata scanning (fast single-pass) ──
