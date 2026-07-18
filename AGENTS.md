@@ -99,9 +99,12 @@ Content search and session search use a generation-counter debounce pattern. Eac
 ### Embedded Web UI
 The web UI HTML/CSS/JS is a single const string (`indexHTML` in `server.go`) — not a separate file. Highlight.js is loaded from CDN.
 
+### Project List Filter
+The project list screen has an inline filter (`f` key) that narrows projects by substring match on `DisplayName`/`DirName`. State: `model.projectFilter []rune` + `model.projectFilterActive bool`. The helper `filteredProjectIndices(tree, filter)` returns matching indices. `projCursor` remains an index into the full `tree.Projects` slice; `projOffset` tracks position in the filtered list for scrolling. Filter persists across project open/close but clears on provider tab switch.
+
 ## Gotchas
 
-- **No tests exist** — there is no test suite. Verify changes manually.
+- **Tests** — `data_test.go` and `search_test.go` cover lazy loading, providers, search, rendering, and filtering. Run with `go test -count=1 -timeout 30s ./...`.
 - **No CGO** — release builds use `CGO_ENABLED=0`. The SQLite driver (`modernc.org/sqlite`) is pure Go. Don't introduce CGO dependencies.
 - **Scanner buffer sizes** — JSONL files can be large. The code sets explicit scanner buffers (up to 10MB in `parseConversation`). If adding new scanners, set appropriate buffer sizes.
 - **Bubble Tea v2 API** — this is NOT the v1 API. Message types and method signatures differ from v1 examples you may find online.

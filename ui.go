@@ -73,9 +73,11 @@ type model struct {
 	providerTab   int         // active tab index in project list
 
 	// Project list screen (current tab's tree)
-	tree       *TreeData
-	projCursor int
-	projOffset int
+	tree              *TreeData
+	projCursor        int
+	projOffset        int
+	projectFilter     []rune // inline filter text for project list
+	projectFilterActive bool // true when filter input is focused
 
 	// Project detail screen
 	activePane           pane
@@ -827,6 +829,8 @@ func (m *model) switchProviderTab(idx int) {
 	m.tree = m.providerTrees[idx]
 	m.projCursor = 0
 	m.projOffset = 0
+	m.projectFilter = nil
+	m.projectFilterActive = false
 }
 
 func (m model) hasMultipleTabs() bool {
@@ -839,10 +843,83 @@ func (m model) hasMultipleTabs() bool {
 	return count > 1
 }
 
+// filteredProjectIndices returns indices of projects matching the current filter.
+// If the filter is empty, all indices are returned.
+func filteredProjectIndices(tree *TreeData, filter []rune) []int {
+	if tree == nil {
+		return nil
+	}
+	if len(filter) == 0 {
+		idxs := make([]int, len(tree.Projects))
+		for i := range tree.Projects {
+			idxs[i] = i
+		}
+		return idxs
+	}
+	q := strings.ToLower(string(filter))
+	var idxs []int
+	for i, p := range tree.Projects {
+		if strings.Contains(strings.ToLower(p.DisplayName), q) ||
+			strings.Contains(strings.ToLower(p.DirName), q) {
+			idxs = append(idxs, i)
+		}
+	}
+	return idxs
+}
+
 func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// ── Filter input mode ──
+	if m.projectFilterActive {
+		switch msg.String() {
+		case "esc":
+			m.projectFilter = nil
+			m.projectFilterActive = false
+			m.projCursor = 0
+			m.projOffset = 0
+			return m, nil
+		case "enter":
+			m.projectFilterActive = false
+			// Snap cursor to nearest match
+			idxs := filteredProjectIndices(m.tree, m.projectFilter)
+			if len(idxs) > 0 {
+				found := false
+				for _, idx := range idxs {
+					if idx >= m.projCursor {
+						m.projCursor = idx
+						found = true
+						break
+					}
+				}
+				if !found {
+					m.projCursor = idxs[len(idxs)-1]
+				}
+			}
+			return m, nil
+		case "backspace":
+			if len(m.projectFilter) > 0 {
+				m.projectFilter = m.projectFilter[:len(m.projectFilter)-1]
+				m.projCursor = 0
+				m.projOffset = 0
+			}
+			return m, nil
+		default:
+			r := []rune(msg.String())
+			if len(r) == 1 && r[0] >= 32 {
+				m.projectFilter = append(m.projectFilter, r[0])
+				m.projCursor = 0
+				m.projOffset = 0
+			}
+			return m, nil
+		}
+	}
+
+	// ── Normal mode ──
 	switch msg.String() {
 	case "q":
 		return m, tea.Quit
+	case "f":
+		m.projectFilterActive = true
+		return m, nil
 	case "1":
 		if m.hasMultipleTabs() {
 			m.switchProviderTab(0)
@@ -869,43 +946,76 @@ func (m model) updateProjectList(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	idxs := filteredProjectIndices(m.tree, m.projectFilter)
+	if len(idxs) == 0 {
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "up", "k":
-		if m.projCursor > 0 {
-			m.projCursor--
+		// Move to previous filtered project
+		for i := len(idxs) - 1; i >= 0; i-- {
+			if idxs[i] < m.projCursor {
+				m.projCursor = idxs[i]
+				break
+			}
 		}
 	case "down", "j":
-		if m.projCursor < len(m.tree.Projects)-1 {
-			m.projCursor++
+		// Move to next filtered project
+		for _, idx := range idxs {
+			if idx > m.projCursor {
+				m.projCursor = idx
+				break
+			}
 		}
 	case "home", "g":
-		m.projCursor = 0
+		m.projCursor = idxs[0]
 	case "end", "G":
-		m.projCursor = len(m.tree.Projects) - 1
+		m.projCursor = idxs[len(idxs)-1]
 	case "enter", "l", "right":
 		cmd := m.openProject(m.projCursor)
 		return m, cmd
 	case "/":
 		m.openSessionSearch(searchScopeGlobal)
 		return m, nil
+	case "esc":
+		// Esc clears filter if one is set (no-op if no filter)
+		if len(m.projectFilter) > 0 {
+			m.projectFilter = nil
+			m.projCursor = 0
+			m.projOffset = 0
+		}
+		return m, nil
 	}
 
-	// Keep cursor visible — account for tab bar height
+	// Keep cursor visible — account for tab bar height and filter bar
+	// projOffset tracks position in the filtered list; projCursor is an index into the full list
+	cursorPos := 0
+	for i, idx := range idxs {
+		if idx == m.projCursor {
+			cursorPos = i
+			break
+		}
+	}
 	tabBarH := 0
 	if m.hasMultipleTabs() {
 		tabBarH = 2
 	}
-	viewH := m.height - 4 - tabBarH
+	filterBarH := 0
+	if len(m.projectFilter) > 0 || m.projectFilterActive {
+		filterBarH = 1
+	}
+	viewH := m.height - 4 - tabBarH - filterBarH
 	itemH := 3 // lines per project item
 	maxVisible := viewH / itemH
 	if maxVisible < 1 {
 		maxVisible = 1
 	}
-	if m.projCursor < m.projOffset {
-		m.projOffset = m.projCursor
+	if cursorPos < m.projOffset {
+		m.projOffset = cursorPos
 	}
-	if m.projCursor >= m.projOffset+maxVisible {
-		m.projOffset = m.projCursor - maxVisible + 1
+	if cursorPos >= m.projOffset+maxVisible {
+		m.projOffset = cursorPos - maxVisible + 1
 	}
 
 	return m, nil
@@ -2415,19 +2525,59 @@ func (m model) renderProjectList() string {
 		return b.String()
 	}
 
-	viewH := m.height - 5 - tabBarH
+	idxs := filteredProjectIndices(m.tree, m.projectFilter)
+
+	// Filter bar
+	filterBarH := 0
+	if len(m.projectFilter) > 0 || m.projectFilterActive {
+		filterBarH = 1
+		if m.projectFilterActive {
+			b.WriteString(backStyle.Render("  Filter: "+string(m.projectFilter)+"_") + dimStyle.Render("  (enter: confirm, esc: clear)"))
+		} else {
+			b.WriteString(backStyle.Render("  Filter: "+string(m.projectFilter)) + dimStyle.Render("  (f: edit, esc: clear)"))
+		}
+		b.WriteString("\n")
+	}
+
+	if len(idxs) == 0 {
+		b.WriteString(dimStyle.Render("  No matching projects.\n"))
+		b.WriteString("\n")
+		b.WriteString(statusStyle.Render(fmt.Sprintf("  0 / %d projects | f: filter | esc: clear | q: quit", len(m.tree.Projects))))
+		return b.String()
+	}
+
+	// Find cursor position in filtered list for scrolling
+	cursorPos := 0
+	for i, idx := range idxs {
+		if idx == m.projCursor {
+			cursorPos = i
+			break
+		}
+	}
+
+	viewH := m.height - 5 - tabBarH - filterBarH
 	itemH := 3
 	maxVisible := viewH / itemH
 	if maxVisible < 1 {
 		maxVisible = 1
 	}
 
-	end := m.projOffset + maxVisible
-	if end > len(m.tree.Projects) {
-		end = len(m.tree.Projects)
+	// Compute visible start without mutating model (value receiver)
+	visStart := m.projOffset
+	if cursorPos < visStart {
+		visStart = cursorPos
+	}
+	if cursorPos >= visStart+maxVisible {
+		visStart = cursorPos - maxVisible + 1
 	}
 
-	for i := m.projOffset; i < end; i++ {
+	end := visStart + maxVisible
+	if end > len(idxs) {
+		end = len(idxs)
+	}
+
+	for fi := visStart; fi < end; fi++ {
+		i := idxs[fi]
 		proj := m.tree.Projects[i]
 		isSelected := i == m.projCursor
 
@@ -2471,16 +2621,20 @@ func (m model) renderProjectList() string {
 	}
 
 	// Pad remaining
-	rendered := (end - m.projOffset) * itemH
+	rendered := (end - visStart) * itemH
 	for i := rendered; i < viewH; i++ {
 		b.WriteString("\n")
 	}
 
 	// Status
 	total := len(m.tree.Projects)
-	hint := " %d projects | enter: open | j/k: navigate | q: quit"
+	filtered := len(idxs)
+	hint := " %d projects | enter: open | j/k: navigate | f: filter | q: quit"
 	if m.hasMultipleTabs() {
-		hint = " %d projects | enter: open | j/k: navigate | tab/1-2: switch | q: quit"
+		hint = " %d projects | enter: open | j/k: navigate | f: filter | tab/1-2: switch | q: quit"
+	}
+	if filtered < total {
+		hint = fmt.Sprintf(" %d / %d projects", filtered, total) + hint[len(fmt.Sprintf(" %d projects", total)):]
 	}
 	b.WriteString(statusStyle.Render(fmt.Sprintf(hint, total)))
 

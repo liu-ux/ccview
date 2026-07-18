@@ -634,3 +634,106 @@ func mustMarshal(v any) json.RawMessage {
 	}
 	return b
 }
+
+// ── filteredProjectIndices ──
+
+func TestFilteredProjectIndices_EmptyFilter(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "alpha", DisplayName: "Alpha Project"},
+			{DirName: "beta", DisplayName: "Beta Project"},
+			{DirName: "gamma", DisplayName: "Gamma Project"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, nil)
+	if len(idxs) != 3 {
+		t.Fatalf("expected 3 indices, got %d", len(idxs))
+	}
+	for i, idx := range idxs {
+		if idx != i {
+			t.Errorf("idxs[%d] = %d, want %d", i, idx, i)
+		}
+	}
+}
+
+func TestFilteredProjectIndices_MatchesDisplayName(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "proj-a", DisplayName: "My Website"},
+			{DirName: "proj-b", DisplayName: "API Server"},
+			{DirName: "proj-c", DisplayName: "Website v2"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, []rune("website"))
+	if len(idxs) != 2 {
+		t.Fatalf("expected 2 matches, got %d", len(idxs))
+	}
+	if idxs[0] != 0 || idxs[1] != 2 {
+		t.Errorf("expected [0,2], got %v", idxs)
+	}
+}
+
+func TestFilteredProjectIndices_MatchesDirName(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "my-app--frontend", DisplayName: "Frontend"},
+			{DirName: "my-app--backend", DisplayName: "Backend"},
+			{DirName: "other-project", DisplayName: "Other"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, []rune("my-app"))
+	if len(idxs) != 2 {
+		t.Fatalf("expected 2 matches, got %d", len(idxs))
+	}
+	if idxs[0] != 0 || idxs[1] != 1 {
+		t.Errorf("expected [0,1], got %v", idxs)
+	}
+}
+
+func TestFilteredProjectIndices_CaseInsensitive(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "alpha", DisplayName: "Alpha"},
+			{DirName: "BETA", DisplayName: "Beta"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, []rune("ALPHA"))
+	if len(idxs) != 1 || idxs[0] != 0 {
+		t.Errorf("expected [0], got %v", idxs)
+	}
+}
+
+func TestFilteredProjectIndices_NoMatch(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "alpha", DisplayName: "Alpha"},
+			{DirName: "beta", DisplayName: "Beta"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, []rune("zzz"))
+	if len(idxs) != 0 {
+		t.Errorf("expected 0 matches, got %d", len(idxs))
+	}
+}
+
+func TestFilteredProjectIndices_NilTree(t *testing.T) {
+	idxs := filteredProjectIndices(nil, []rune("test"))
+	if len(idxs) != 0 {
+		t.Errorf("expected 0 for nil tree, got %d", len(idxs))
+	}
+}
+
+func TestFilteredProjectIndices_SubstringMatch(t *testing.T) {
+	tree := &TreeData{
+		Projects: []TreeProject{
+			{DirName: "project-alpha", DisplayName: "Alpha"},
+			{DirName: "project-beta", DisplayName: "Beta"},
+			{DirName: "gamma", DisplayName: "Gamma Project"},
+		},
+	}
+	idxs := filteredProjectIndices(tree, []rune("project"))
+	// "project-alpha" dir contains "project", "project-beta" dir contains "project", "Gamma Project" display contains "project"
+	if len(idxs) != 3 {
+		t.Errorf("expected 3 matches, got %d: %v", len(idxs), idxs)
+	}
+}
