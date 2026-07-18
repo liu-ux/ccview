@@ -53,7 +53,7 @@ release:
     ### Bug Fixes
     - Fixed Windows installer path handling
   github:
-    owner: shivamstaq
+    owner: liu-ux
     name: ccview
   draft: false
   prerelease: auto
