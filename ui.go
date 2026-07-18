@@ -2277,7 +2277,7 @@ func (m model) renderFullWidth() string {
 		}
 		b.WriteString(statusHighlight.Render(" /") + statusStyle.Render(query+"\u2588") + dimStyle.Render(matchInfo))
 	} else {
-		b.WriteString(statusStyle.Render(" j/k: scroll | pgup/pgdn | /: search | e: export | q: quit"))
+		b.WriteString(statusStyle.Render(" j/k: scroll | pgup/pgdn | /: search | t: tools | e: export | q: quit"))
 	}
 	return b.String()
 }
@@ -2606,7 +2606,7 @@ func (m model) renderStatus() string {
 		if len(m.contentMatches) > 0 {
 			parts = append(parts, fmt.Sprintf("%d/%d", m.contentMatchIdx+1, len(m.contentMatches)))
 		}
-		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "tab:sidebar", "e:export", "q:quit")
+		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "t:tools", "tab:sidebar", "e:export", "q:quit")
 	}
 	return statusStyle.Render(" " + strings.Join(parts, "  "))
 }
