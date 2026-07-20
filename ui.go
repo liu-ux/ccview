@@ -99,6 +99,11 @@ type model struct {
 	contentTitle  string
 	contentPath   string
 	contentKind   string
+	turnLines     []int // turn number (0-indexed) → line index in contentLines
+
+	// Jump-to-turn mode
+	jumpMode  bool
+	jumpInput []rune
 
 	directFile    string
 	directProject string // -project flag: auto-open this project after Level 0
@@ -182,11 +187,12 @@ type exportState struct {
 // ── Messages ──
 
 type contentLoadedMsg struct {
-	lines []string
-	title string
-	path  string
-	kind  string
-	err   error
+	lines     []string
+	turnLines []int // turn number (0-indexed) → line index
+	title     string
+	path      string
+	kind      string
+	err       error
 }
 type statusClearMsg struct{}
 
@@ -390,10 +396,10 @@ func loadConvCmd(path, title string, width int, provider Provider, showToolDetai
 			entries, err = parseConversation(path)
 		}
 		if err != nil {
-			return contentLoadedMsg{nil, title, path, "conversation", err}
+			return contentLoadedMsg{nil, nil, title, path, "conversation", err}
 		}
-		lines := renderConversation(entries, width, showToolDetails, showToolResults, showThinking)
-		return contentLoadedMsg{lines, title, path, "conversation", nil}
+		lines, turnLines := renderConversation(entries, width, showToolDetails, showToolResults, showThinking)
+		return contentLoadedMsg{lines, turnLines, title, path, "conversation", nil}
 	}
 }
 
@@ -401,13 +407,13 @@ func loadFileCmd(path, title string, width int) tea.Cmd {
 	return func() tea.Msg {
 		content, err := readFileContent(path)
 		if err != nil {
-			return contentLoadedMsg{nil, title, path, "file", err}
+			return contentLoadedMsg{nil, nil, title, path, "file", err}
 		}
 		if strings.HasSuffix(path, ".md") {
 			rendered := renderMarkdownTerm(content, width)
-			return contentLoadedMsg{strings.Split(rendered, "\n"), title, path, "file", nil}
+			return contentLoadedMsg{strings.Split(rendered, "\n"), nil, title, path, "file", nil}
 		}
-		return contentLoadedMsg{strings.Split(content, "\n"), title, path, "file", nil}
+		return contentLoadedMsg{strings.Split(content, "\n"), nil, title, path, "file", nil}
 	}
 }
 
@@ -706,10 +712,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Tick(3*time.Second, func(time.Time) tea.Msg { return statusClearMsg{} })
 		}
 		m.contentLines = msg.lines
+		m.turnLines = msg.turnLines
 		m.contentTitle = msg.title
 		m.contentPath = msg.path
 		m.contentKind = msg.kind
 		m.contentOffset = 0
+		m.jumpMode = false
+		m.jumpInput = nil
 		if m.directFile != "" {
 			m.state = viewProjectDetail
 		}
@@ -1212,6 +1221,11 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.updateContentSearch(msg)
 	}
 
+	// Jump-to-turn mode intercepts keys
+	if m.jumpMode {
+		return m.updateJumpMode(msg)
+	}
+
 	_, paneH := m.contentPaneDims()
 	contentH := paneH - 2
 	maxOff := len(m.contentLines) - contentH
@@ -1312,8 +1326,81 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.contentPath != "" {
 			return m, openInEditor(m.contentPath)
 		}
+	case "\\":
+		if len(m.turnLines) > 0 {
+			m.jumpMode = true
+			m.jumpInput = nil
+		}
+	case "[":
+		// Jump to previous turn
+		if len(m.turnLines) > 0 {
+			for i := len(m.turnLines) - 1; i >= 0; i-- {
+				if m.turnLines[i] < m.contentOffset {
+					m.contentOffset = m.turnLines[i]
+					break
+				}
+			}
+		}
+	case "]":
+		// Jump to next turn
+		if len(m.turnLines) > 0 {
+			for _, lineIdx := range m.turnLines {
+				if lineIdx > m.contentOffset {
+					m.contentOffset = lineIdx
+					break
+				}
+			}
+		}
 	}
 	return m, nil
+}
+
+func (m model) updateJumpMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	switch key {
+	case "esc":
+		m.jumpMode = false
+		m.jumpInput = nil
+		return m, nil
+	case "enter":
+		if len(m.jumpInput) > 0 {
+			turn := 0
+			for _, r := range m.jumpInput {
+				turn = turn*10 + int(r-'0')
+			}
+			m.jumpMode = false
+			m.jumpInput = nil
+			// Jump to turn (1-indexed)
+			idx := turn - 1
+			if idx >= 0 && idx < len(m.turnLines) {
+				m.contentOffset = m.turnLines[idx]
+				// Clamp
+				_, paneH := m.contentPaneDims()
+				contentH := paneH - 2
+				maxOff := len(m.contentLines) - contentH
+				if maxOff < 0 {
+					maxOff = 0
+				}
+				if m.contentOffset > maxOff {
+					m.contentOffset = maxOff
+				}
+			}
+			return m, nil
+		}
+		m.jumpMode = false
+		return m, nil
+	case "backspace":
+		if len(m.jumpInput) > 0 {
+			m.jumpInput = m.jumpInput[:len(m.jumpInput)-1]
+		}
+		return m, nil
+	default:
+		r := []rune(key)
+		if len(r) == 1 && r[0] >= '0' && r[0] <= '9' {
+			m.jumpInput = append(m.jumpInput, r[0])
+		}
+		return m, nil
+	}
 }
 
 func (m model) contentSearchDebounceCmd() tea.Cmd {
@@ -3015,6 +3102,13 @@ func (m model) buildContentLines(w, h int) []string {
 // ── Status bar ──
 
 func (m model) renderStatus() string {
+	// Jump-to-turn input bar
+	if m.jumpMode {
+		return statusHighlight.Render(" [") +
+			statusStyle.Render(string(m.jumpInput)+"\u2588") +
+			statusStyle.Render("  enter:jump  esc:cancel")
+	}
+
 	// Content search input bar
 	if m.contentSearchActive {
 		query := string(m.contentSearchInput)
@@ -3059,20 +3153,22 @@ func (m model) renderStatus() string {
 		if len(m.contentMatches) > 0 {
 			parts = append(parts, fmt.Sprintf("%d/%d", m.contentMatchIdx+1, len(m.contentMatches)))
 		}
-		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "t:tools", "T:think", "R:result", "tab:sidebar", "e:export", "q:quit")
+		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "[]:turn", "\\:jump", "t:tools", "T:think", "R:result", "tab:sidebar", "e:export", "q:quit")
 	}
 	return statusStyle.Render(" " + strings.Join(parts, "  "))
 }
 
 // ── Conversation rendering ──
 
-func renderConversation(entries []Entry, width int, showToolDetails bool, showToolResults bool, showThinking bool) []string {
+func renderConversation(entries []Entry, width int, showToolDetails bool, showToolResults bool, showThinking bool) ([]string, []int) {
 	contentWidth := width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
 	}
 
 	var lines []string
+	var turnLines []int // turn number (0-indexed) → line index
+	turn := 0
 	sep := faintStyle.Render(strings.Repeat("\u2500", width))
 
 	// Pre-pass: collect tool results by tool_use_id for inline matching
@@ -3142,8 +3238,10 @@ func renderConversation(entries []Entry, width int, showToolDetails bool, showTo
 				continue
 			}
 
+			turn++
+			turnLines = append(turnLines, len(lines))
 			ts := formatTimestamp(entry.Timestamp)
-			header := userHeaderStyle.Render(fmt.Sprintf(" USER  %s ", ts))
+			header := userHeaderStyle.Render(fmt.Sprintf(" #%-3d USER  %s ", turn, ts))
 			lines = append(lines, "", sep, header, "")
 			for _, b := range blocks {
 				if b.Type == "text" && b.Text != "" {
@@ -3166,7 +3264,11 @@ func renderConversation(entries []Entry, width int, showToolDetails bool, showTo
 			if modelName != "" {
 				label = fmt.Sprintf("ASSISTANT  %s", modelName)
 			}
-			header := assistantHeaderStyle.Render(fmt.Sprintf(" %s  %s ", label, ts))
+			turnLabel := ""
+			if turn > 0 {
+				turnLabel = fmt.Sprintf(" #%-3d ", turn)
+			}
+			header := assistantHeaderStyle.Render(fmt.Sprintf(" %s%s  %s ", turnLabel, label, ts))
 			lines = append(lines, "", sep, header, "")
 
 			for _, b := range blocks {
@@ -3257,5 +3359,5 @@ func renderConversation(entries []Entry, width int, showToolDetails bool, showTo
 	}
 
 	lines = append(lines, "", sep, dimStyle.Render("  End of conversation"), "")
-	return lines
+	return lines, turnLines
 }

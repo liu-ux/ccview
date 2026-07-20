@@ -502,7 +502,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// Without tool details
-	linesOff := renderConversation(entries, 80, false, false, false)
+	linesOff, _ := renderConversation(entries, 80, false, false, false)
 	foundDetailOff := false
 	for _, l := range linesOff {
 		if strings.Contains(l, "command") {
@@ -514,7 +514,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// With tool details
-	linesOn := renderConversation(entries, 80, true, false, false)
+	linesOn, _ := renderConversation(entries, 80, true, false, false)
 	foundDetailOn := false
 	for _, l := range linesOn {
 		if strings.Contains(l, "command") {
