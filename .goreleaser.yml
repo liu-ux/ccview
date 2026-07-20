@@ -44,11 +44,13 @@ release:
     - **Tool call detail toggle** — press `t` to expand tool inputs, `T` for thinking blocks, `R` for inline tool results
     - **Split-pane rendering** — tool results render inline below their matching tool call
     - **Content search** — press `/` in the viewer for live search with `n`/`N` match navigation
+    - **Turn numbers** — each message displays its conversation turn number in the header
+    - **Turn navigation** — press `[`/`]` to jump to previous/next turn; press `\` + number + Enter to jump to a specific turn
 
     ### Search
     - **Session search overlay** — press `/` from the project list (global) or sidebar (project-scoped)
     - **Content scope toggle** — `Tab` switches between title search and full-content search (ripgrep/grep/SQL)
-    - **Sidebar filter** — press `f` in search results to filter the sidebar to matching sessions
+    - **Sidebar filter** — press `Alt+F` in search results to filter the sidebar to matching sessions
 
     ### Bug Fixes
     - Fixed Windows installer path handling
