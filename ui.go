@@ -1442,7 +1442,7 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.sessionSearch.contentSearch = true
 		m.sessionSearch.gen++
 		return m, m.sessionSearchDebounceCmd()
-	case "f":
+	case "alt+f":
 		// Apply sidebar filter from search results
 		if len(m.sessionSearch.results) > 0 {
 			m.sidebarFilter = make(map[string]bool)
@@ -1862,7 +1862,7 @@ func (m model) renderSessionSearchOverlay() string {
 
 	lines = append(lines, "")
 	resultCount := len(m.sessionSearch.results)
-	hint := fmt.Sprintf(" %d results  ↑↓:navigate  enter:open  f:filter  alt+t:title  alt+c:content  tab:scope  esc:close", resultCount)
+	hint := fmt.Sprintf(" %d results  ↑↓:navigate  enter:open  alt+f:filter  alt+t:title  alt+c:content  tab:scope  esc:close", resultCount)
 	lines = append(lines, dimStyle.Render(hint))
 
 	overlayBox := lipgloss.NewStyle().
