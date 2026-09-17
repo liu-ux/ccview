@@ -238,15 +238,8 @@ func exportHTMLTo(entries []Entry, w io.Writer, sourcePath string) error {
 			fmt.Fprint(w, `</div>`)
 
 		case "system":
-			if entry.Subtype == "local_command" {
-				cmd := entry.Content
-				if idx := strings.Index(cmd, "<command-name>"); idx >= 0 {
-					start := idx + len("<command-name>")
-					if end := strings.Index(cmd[start:], "</command-name>"); end >= 0 {
-						cmd = cmd[start : start+end]
-					}
-				}
-				fmt.Fprintf(w, `<div class="system-msg">[system] %s</div>`, html.EscapeString(cmd))
+			if label, body, ok := formatSystemEntry(entry); ok {
+				fmt.Fprintf(w, `<div class="system-msg">[%s] %s</div>`, html.EscapeString(label), html.EscapeString(body))
 			}
 		}
 	}
@@ -333,9 +326,8 @@ func exportMarkdown(entries []Entry, outPath, sourcePath string) error {
 			}
 
 		case "system":
-			if entry.Subtype == "local_command" {
-				cmd := extractCommandName(entry.Content)
-				fmt.Fprintf(f, "*[system] %s*\n\n", cmd)
+			if label, body, ok := formatSystemEntry(entry); ok {
+				fmt.Fprintf(f, "*[%s] %s*\n\n", label, body)
 			}
 		}
 	}
@@ -526,15 +518,8 @@ func exportHTMLWithNav(entries []Entry, w io.Writer, sourcePath, navHTML string)
 			fmt.Fprint(w, `</div>`)
 
 		case "system":
-			if entry.Subtype == "local_command" {
-				cmd := entry.Content
-				if idx := strings.Index(cmd, "<command-name>"); idx >= 0 {
-					start := idx + len("<command-name>")
-					if end := strings.Index(cmd[start:], "</command-name>"); end >= 0 {
-						cmd = cmd[start : start+end]
-					}
-				}
-				fmt.Fprintf(w, `<div class="system-msg">[system] %s</div>`, html.EscapeString(cmd))
+			if label, body, ok := formatSystemEntry(entry); ok {
+				fmt.Fprintf(w, `<div class="system-msg">[%s] %s</div>`, html.EscapeString(label), html.EscapeString(body))
 			}
 		}
 	}

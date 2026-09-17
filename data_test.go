@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -502,7 +503,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// Without tool details
-	linesOff, _ := renderConversation(entries, 80, false, false, false)
+	linesOff, _ := renderConversation(entries, 80, false, false, false, true)
 	foundDetailOff := false
 	for _, l := range linesOff {
 		if strings.Contains(l, "command") {
@@ -514,7 +515,7 @@ func TestRenderConversation_ToolDetailsToggle(t *testing.T) {
 	}
 
 	// With tool details
-	linesOn, _ := renderConversation(entries, 80, true, false, false)
+	linesOn, _ := renderConversation(entries, 80, true, false, false, true)
 	foundDetailOn := false
 	for _, l := range linesOn {
 		if strings.Contains(l, "command") {
@@ -735,5 +736,193 @@ func TestFilteredProjectIndices_SubstringMatch(t *testing.T) {
 	// "project-alpha" dir contains "project", "project-beta" dir contains "project", "Gamma Project" display contains "project"
 	if len(idxs) != 3 {
 		t.Errorf("expected 3 matches, got %d: %v", len(idxs), idxs)
+	}
+}
+
+// ── System entries ──
+
+func TestFormatSystemEntry(t *testing.T) {
+	tests := []struct {
+		name      string
+		entry     Entry
+		wantLabel string
+		wantBody  string
+		wantOK    bool
+	}{
+		{
+			name:      "local_command extracts the command name",
+			entry:     Entry{Type: "system", Subtype: "local_command", Content: "<command-name>/clear</command-name>"},
+			wantLabel: "system", wantBody: "/clear", wantOK: true,
+		},
+		{
+			name:      "local_command without tags keeps its content",
+			entry:     Entry{Type: "system", Subtype: "local_command", Content: "plain output"},
+			wantLabel: "system", wantBody: "plain output", wantOK: true,
+		},
+		{
+			name:   "local_command without content is skipped",
+			entry:  Entry{Type: "system", Subtype: "local_command"},
+			wantOK: false,
+		},
+		{
+			name: "compact_boundary with metadata",
+			entry: Entry{Type: "system", Subtype: "compact_boundary", Content: "Conversation compacted",
+				CompactMetadata: &CompactMetadata{Trigger: "manual", PreTokens: 120472, PostTokens: 11088, DurationMs: 59427}},
+			wantLabel: "compact", wantBody: "Conversation compacted (pre 120472 → post 11088 tok, 59s)", wantOK: true,
+		},
+		{
+			name:      "compact_boundary without metadata",
+			entry:     Entry{Type: "system", Subtype: "compact_boundary"},
+			wantLabel: "compact", wantBody: "Conversation compacted", wantOK: true,
+		},
+		{
+			name:      "turn_duration with message count",
+			entry:     Entry{Type: "system", Subtype: "turn_duration", DurationMs: 647482, MessageCount: 316},
+			wantLabel: "turn", wantBody: "10m47s · 316 msgs", wantOK: true,
+		},
+		{
+			name:      "turn_duration without message count",
+			entry:     Entry{Type: "system", Subtype: "turn_duration", DurationMs: 59427},
+			wantLabel: "turn", wantBody: "59s", wantOK: true,
+		},
+		{
+			name:   "turn_duration without a duration is skipped",
+			entry:  Entry{Type: "system", Subtype: "turn_duration", MessageCount: 3},
+			wantOK: false,
+		},
+		{
+			name:      "api_error with a flat message",
+			entry:     Entry{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"status":429,"error":{"message":"slow down"}}`)},
+			wantLabel: "error", wantBody: "429 slow down", wantOK: true,
+		},
+		{
+			name:      "api_error with a nested message",
+			entry:     Entry{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"status":401,"error":{"error":{"message":"bad key"}}}`)},
+			wantLabel: "error", wantBody: "401 bad key", wantOK: true,
+		},
+		{
+			name:      "api_error with a status only",
+			entry:     Entry{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"status":521,"headers":{}}`)},
+			wantLabel: "error", wantBody: "HTTP 521", wantOK: true,
+		},
+		{
+			name:      "api_error with neither status nor message",
+			entry:     Entry{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"type":"error"}`)},
+			wantLabel: "error", wantBody: "request failed", wantOK: true,
+		},
+		{
+			name:      "unknown subtype falls back to its content",
+			entry:     Entry{Type: "system", Subtype: "stop_hook_summary", Content: "hook ran"},
+			wantLabel: "system", wantBody: "hook ran", wantOK: true,
+		},
+		{
+			name:   "unknown subtype without content is skipped",
+			entry:  Entry{Type: "system", Subtype: "away_summary"},
+			wantOK: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			label, body, ok := formatSystemEntry(tc.entry)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (label=%q body=%q)", ok, tc.wantOK, label, body)
+			}
+			if !ok {
+				return
+			}
+			if label != tc.wantLabel || body != tc.wantBody {
+				t.Errorf("got (%q, %q), want (%q, %q)", label, body, tc.wantLabel, tc.wantBody)
+			}
+		})
+	}
+}
+
+func TestFormatSystemEntry_TruncatesAndFlattens(t *testing.T) {
+	long := strings.Repeat("x", maxSystemBodyLen+50)
+	entry := Entry{Type: "system", Subtype: "api_error", Error: mustMarshal(map[string]any{
+		"status": 500,
+		"error":  map[string]any{"message": "line one\nline two " + long},
+	})}
+	_, body, ok := formatSystemEntry(entry)
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if strings.Contains(body, "\n") {
+		t.Errorf("body must be a single line, got %q", body)
+	}
+	if !strings.HasSuffix(body, "…") {
+		t.Errorf("expected a trailing ellipsis, got %q", body)
+	}
+	if n := len([]rune(body)); n != maxSystemBodyLen+1 {
+		t.Errorf("body = %d runes, want %d plus the ellipsis", n, maxSystemBodyLen)
+	}
+}
+
+func TestRenderConversation_SystemToggle(t *testing.T) {
+	entries := []Entry{
+		{Type: "system", Subtype: "local_command", Content: "<command-name>/clear</command-name>"},
+		{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"status":401,"error":{"message":"bad key"}}`)},
+		{Type: "user", Parsed: &ParsedMessage{Role: "user", Content: mustMarshal([]ContentBlock{{Type: "text", Text: "hello"}})}},
+	}
+
+	// The error line is styled in two pieces (label, then body), so assert on
+	// them separately rather than across the style boundary.
+	onLines, _ := renderConversation(entries, 80, false, false, false, true)
+	on := strings.Join(onLines, "\n")
+	for _, want := range []string{"[system] /clear", "[error]", "401 bad key", "hello"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("showSystem=true: missing %q", want)
+		}
+	}
+
+	offLines, _ := renderConversation(entries, 80, false, false, false, false)
+	off := strings.Join(offLines, "\n")
+	for _, unwanted := range []string{"[system]", "[error]", "bad key"} {
+		if strings.Contains(off, unwanted) {
+			t.Errorf("showSystem=false: unexpected %q", unwanted)
+		}
+	}
+	if !strings.Contains(off, "hello") {
+		t.Error("showSystem=false must not drop user messages")
+	}
+}
+
+func TestExportSurfaces_RenderSystemEntries(t *testing.T) {
+	entries := []Entry{
+		{Type: "system", Subtype: "api_error", Error: json.RawMessage(`{"status":401,"error":{"message":"bad key"}}`)},
+		{Type: "system", Subtype: "compact_boundary", CompactMetadata: &CompactMetadata{PreTokens: 100, PostTokens: 10, DurationMs: 5000}},
+	}
+	want := []string{"[error] 401 bad key", "[compact] Conversation compacted"}
+
+	// Every export surface calls the same formatter, and none of them honours
+	// the TUI display toggles.
+	var plainHTML bytes.Buffer
+	if err := exportHTMLTo(entries, &plainHTML, "conv.jsonl"); err != nil {
+		t.Fatalf("exportHTMLTo: %v", err)
+	}
+	var navHTML bytes.Buffer
+	if err := exportHTMLWithNav(entries, &navHTML, "conv.jsonl", ""); err != nil {
+		t.Fatalf("exportHTMLWithNav: %v", err)
+	}
+	mdPath := filepath.Join(t.TempDir(), "out.md")
+	if err := exportMarkdown(entries, mdPath, "conv.jsonl"); err != nil {
+		t.Fatalf("exportMarkdown: %v", err)
+	}
+	md, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read markdown: %v", err)
+	}
+
+	surfaces := map[string]string{
+		"html":     plainHTML.String(),
+		"html+nav": navHTML.String(),
+		"markdown": string(md),
+	}
+	for name, got := range surfaces {
+		for _, w := range want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s export missing %q", name, w)
+			}
+		}
 	}
 }

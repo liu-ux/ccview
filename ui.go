@@ -132,6 +132,7 @@ type model struct {
 	showToolDetails bool
 	showToolResults bool // toggle tool_result display
 	showThinking    bool // toggle thinking block display
+	showSystem      bool // toggle system transcript entries (visible by default)
 
 	// Sidebar filter (from search results)
 	sidebarFilter map[string]bool // conversation paths to show; nil = show all
@@ -326,13 +327,16 @@ func newModel(directFile, directProject string, providers []Provider) model {
 		directFile:    directFile,
 		directProject: directProject,
 		providers:     providers,
+		// Unlike the other display toggles, system entries are shown by
+		// default, so this one cannot rely on the zero value.
+		showSystem: true,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	debugLog("Init: providers=%d", len(m.providers))
 	if m.directFile != "" {
-		return loadConvCmd(m.directFile, m.directFile, 120, nil, false, false, false)
+		return loadConvCmd(m.directFile, m.directFile, 120, nil, false, false, false, true)
 	}
 	return m.loadAllProjectListsCmd()
 }
@@ -386,7 +390,7 @@ func loadHistoryTitlesCmd() tea.Cmd {
 	}
 }
 
-func loadConvCmd(path, title string, width int, provider Provider, showToolDetails, showToolResults, showThinking bool) tea.Cmd {
+func loadConvCmd(path, title string, width int, provider Provider, showToolDetails, showToolResults, showThinking, showSystem bool) tea.Cmd {
 	return func() tea.Msg {
 		var entries []Entry
 		var err error
@@ -398,7 +402,7 @@ func loadConvCmd(path, title string, width int, provider Provider, showToolDetai
 		if err != nil {
 			return contentLoadedMsg{nil, nil, title, path, "conversation", err}
 		}
-		lines, turnLines := renderConversation(entries, width, showToolDetails, showToolResults, showThinking)
+		lines, turnLines := renderConversation(entries, width, showToolDetails, showToolResults, showThinking, showSystem)
 		return contentLoadedMsg{lines, turnLines, title, path, "conversation", nil}
 	}
 }
@@ -513,7 +517,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		if m.state == viewProjectDetail && m.contentPath != "" && m.contentKind == "conversation" && oldW != msg.Width {
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 		}
 		return m, nil
 
@@ -785,7 +789,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// If project detail is loaded, also load the conversation
 		if !m.projectDetailLoading {
 			_, rw := m.paneWidths()
-			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking))
+			return m, tea.Batch(cmd, loadConvCmd(msg.convPath, msg.convTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem))
 		}
 		return m, cmd
 
@@ -1172,11 +1176,11 @@ func (m model) updateSidebar(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				}
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 			case "subagent":
 				m.contentTitle = item.label
 				m.contentLines = nil
-				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+				return m, loadConvCmd(item.path, item.label, rightW, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 			case "file":
 				m.contentTitle = item.label
 				m.contentLines = nil
@@ -1308,21 +1312,28 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if m.contentKind == "conversation" {
 			m.showToolDetails = !m.showToolDetails
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 		}
 	case "T":
 		// Toggle thinking block display
 		if m.contentKind == "conversation" {
 			m.showThinking = !m.showThinking
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 		}
 	case "R":
 		// Toggle tool result display
 		if m.contentKind == "conversation" {
 			m.showToolResults = !m.showToolResults
 			_, rw := m.paneWidths()
-			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking)
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
+		}
+	case "S":
+		// Toggle system transcript entries
+		if m.contentKind == "conversation" {
+			m.showSystem = !m.showSystem
+			_, rw := m.paneWidths()
+			return m, loadConvCmd(m.contentPath, m.contentTitle, rw, m.currentProvider, m.showToolDetails, m.showToolResults, m.showThinking, m.showSystem)
 		}
 	case "o":
 		if m.contentPath != "" {
@@ -3244,14 +3255,14 @@ func (m model) renderStatus() string {
 		if len(m.contentMatches) > 0 {
 			parts = append(parts, fmt.Sprintf("%d/%d", m.contentMatchIdx+1, len(m.contentMatches)))
 		}
-		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "[]:turn", "\\:jump", "t:tools", "T:think", "R:result", "tab:sidebar", "e:export", "q:quit")
+		parts = append(parts, "j/k:scroll", "/:search", "n/N:match", "[]:turn", "\\:jump", "t:tools", "T:think", "R:result", "S:system", "tab:sidebar", "e:export", "q:quit")
 	}
 	return statusStyle.Render(" " + strings.Join(parts, "  "))
 }
 
 // ── Conversation rendering ──
 
-func renderConversation(entries []Entry, width int, showToolDetails bool, showToolResults bool, showThinking bool) ([]string, []int) {
+func renderConversation(entries []Entry, width int, showToolDetails bool, showToolResults bool, showThinking bool, showSystem bool) ([]string, []int) {
 	contentWidth := width - 4
 	if contentWidth < 20 {
 		contentWidth = 20
@@ -3442,9 +3453,19 @@ func renderConversation(entries []Entry, width int, showToolDetails bool, showTo
 			}
 
 		case "system":
-			if entry.Subtype == "local_command" {
-				cmd := extractCommandName(entry.Content)
-				lines = append(lines, systemStyle.Render(fmt.Sprintf("  [system] %s", cmd)))
+			if !showSystem {
+				continue
+			}
+			label, body, ok := formatSystemEntry(entry)
+			if !ok {
+				continue
+			}
+			// Errors get their own colour so they stand out from routine
+			// metadata; the body stays gray either way.
+			if label == "error" {
+				lines = append(lines, toolStyle.Render("  [error]")+" "+systemStyle.Render(body))
+			} else {
+				lines = append(lines, systemStyle.Render(fmt.Sprintf("  [%s] %s", label, body)))
 			}
 		}
 	}

@@ -111,8 +111,8 @@ func serveMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			messages = append(messages, mv)
 		case "system":
-			if entry.Subtype == "local_command" {
-				messages = append(messages, messageView{Type: "system", Timestamp: formatTimestampFull(entry.Timestamp), HTML: html.EscapeString(extractCommandName(entry.Content))})
+			if label, body, ok := formatSystemEntry(entry); ok {
+				messages = append(messages, messageView{Type: "system", Timestamp: formatTimestampFull(entry.Timestamp), HTML: html.EscapeString("[" + label + "] " + body)})
 			}
 		}
 	}
@@ -151,16 +151,6 @@ func serveExport(w http.ResponseWriter, r *http.Request) {
 	if err := exportHTMLTo(entries, w, path); err != nil {
 		log.Printf("export error: %v", err)
 	}
-}
-
-func extractCommandName(content string) string {
-	if idx := strings.Index(content, "<command-name>"); idx >= 0 {
-		start := idx + len("<command-name>")
-		if end := strings.Index(content[start:], "</command-name>"); end >= 0 {
-			return content[start : start+end]
-		}
-	}
-	return content
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {
@@ -496,7 +486,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
         if(m.tokens){var tok='in:'+m.tokens['in']+' out:'+m.tokens.out;if(m.tokens.cacheRead) tok+=' cache:'+m.tokens.cacheRead;h+='<div class="token-info">'+tok+'</div>';}
         h+='</div>';
       }else if(m.type==='system'){
-        h+='<div class="system-msg">[system] '+m.html+'</div>';
+        h+='<div class="system-msg">'+m.html+'</div>';
       }
     }
     if(!messages.length) h+='<div style="padding:28px;color:var(--text-muted);text-align:center">No messages</div>';

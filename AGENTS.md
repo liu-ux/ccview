@@ -93,6 +93,9 @@ Three view states: `viewLoading` → `viewProjectList` → `viewProjectDetail`. 
 ### Content Block Rendering
 Both providers normalize their data into `ContentBlock` with types: `text`, `thinking`, `tool_use`, `tool_result`. The `getContentBlocks()` function handles polymorphic JSON content (string or array).
 
+### System Entry Rendering
+Entries with `type: "system"` (harness metadata: command output, compaction, turn durations, API errors) are formatted by `formatSystemEntry()` in `parse.go`, which returns a `(label, body)` pair. It is the single source of truth for all four surfaces — TUI (`renderConversation`), HTML export (`export.go`, 2 call sites), Markdown export, and the web UI (`serveMessages`) — so a subtype only ever needs formatting in one place. Unknown subtypes with content fall through to a generic rendering, because the set of subtypes grows with each Claude Code release. Fields the formatter needs (`Error`, `DurationMs`, `MessageCount`, `CompactMetadata`) are parsed into `Entry`; an unparsed field silently renders as missing.
+
 ### Debounced Search
 Content search and session search use a generation-counter debounce pattern. Each keypress increments `contentSearchGen`/`sessionSearch.gen`; a `tea.Tick` fires after delay and only the latest generation triggers the actual search.
 
@@ -116,3 +119,5 @@ The project list screen has an inline filter (`f` key) that narrows projects by 
 - **Lazy loading state** — `model.projectDetailLoading` is true while Level 2 is loading for a project. The sidebar shows a "Loading..." header during this time. The `projectDetailReadyMsg` handler rebuilds the sidebar when data arrives.
 - **Web server API** — the web mode's `/api/tree` endpoint only loads Claude data (calls `loadTree()` directly, not through providers). OpenCode data is not served via web mode.
 - **Paste** — bracketed paste is enabled (nothing sets `DisableBracketedPasteMode` on the `tea.View`), so pasted text arrives as `tea.PasteMsg`, **never** as a run of `tea.KeyPressMsg`. Every text input must be routed in `handlePaste()`; adding a new text input without a case there means it silently ignores pastes. Text is normalized by `sanitizePaste()` (whitespace runs collapse to one space, control characters dropped, capped at `maxPasteLen`).
+- **Display toggles are TUI-only** — `t` / `T` / `R` / `S` change what the viewer renders, and nothing else. Export (HTML, Markdown) and the web UI always render everything, because they are the complete record. Do not make export honour a toggle to "fix" the inconsistency.
+- **`showSystem` defaults to on** — unlike the other display toggles, which rely on the zero value, `showSystem` is initialized in `newModel()`. Building a `model` literal without it (as tests do) yields a viewer with system entries hidden.

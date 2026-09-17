@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/glamour"
 )
@@ -28,6 +29,21 @@ type Entry struct {
 	Slug       string          `json:"slug"`
 	Message    json.RawMessage `json:"message"`
 	Parsed     *ParsedMessage  `json:"-"`
+
+	// System entry fields (Type == "system").
+	Error           json.RawMessage  `json:"error"`           // subtype api_error
+	DurationMs      int64            `json:"durationMs"`      // subtype turn_duration
+	MessageCount    int              `json:"messageCount"`    // subtype turn_duration
+	CompactMetadata *CompactMetadata `json:"compactMetadata"` // subtype compact_boundary
+}
+
+// CompactMetadata describes a context compaction, carried by system entries
+// with subtype "compact_boundary".
+type CompactMetadata struct {
+	Trigger    string `json:"trigger"`
+	PreTokens  int    `json:"preTokens"`
+	PostTokens int    `json:"postTokens"`
+	DurationMs int64  `json:"durationMs"`
 }
 
 type ParsedMessage struct {
@@ -409,6 +425,188 @@ func formatTimestampFull(ts string) string {
 		}
 	}
 	return ts
+}
+
+// ── System entries ──
+
+// maxSystemBodyLen caps the rendered body of a system entry. api_error bodies
+// carry a full Node stack trace; only the first line is signal.
+const maxSystemBodyLen = 120
+
+// formatSystemEntry renders a system transcript entry as a short label and a
+// single-line body, both safe to print as-is. ok is false when the entry
+// carries nothing worth showing, in which case the caller must skip it.
+func formatSystemEntry(e Entry) (label, body string, ok bool) {
+	label, body, ok = systemEntryParts(e)
+	if !ok {
+		return "", "", false
+	}
+	return label, truncateSystemBody(body), true
+}
+
+// systemEntryParts is the per-subtype half of formatSystemEntry; it does not
+// normalize the body.
+//
+// Unknown subtypes that carry content fall through to a generic rendering: new
+// harness versions add subtypes (stop_hook_summary, away_summary, ...), and
+// silently dropping those is worse than an unstyled line.
+func systemEntryParts(e Entry) (label, body string, ok bool) {
+	switch e.Subtype {
+	case "local_command":
+		if e.Content == "" {
+			return "", "", false
+		}
+		return "system", extractCommandName(e.Content), true
+
+	case "compact_boundary":
+		body = e.Content
+		if body == "" {
+			body = "Conversation compacted"
+		}
+		if md := e.CompactMetadata; md != nil {
+			body = fmt.Sprintf("%s (pre %d \u2192 post %d tok", body, md.PreTokens, md.PostTokens)
+			if md.DurationMs > 0 {
+				body += fmt.Sprintf(", %s", formatDurationMs(md.DurationMs))
+			}
+			body += ")"
+		}
+		return "compact", body, true
+
+	case "turn_duration":
+		if e.DurationMs <= 0 {
+			return "", "", false
+		}
+		body = formatDurationMs(e.DurationMs)
+		if e.MessageCount > 0 {
+			body += fmt.Sprintf(" \u00b7 %d msgs", e.MessageCount)
+		}
+		return "turn", body, true
+
+	case "api_error":
+		status, msg := parseSystemError(e.Error)
+		switch {
+		case status > 0 && msg != "":
+			return "error", fmt.Sprintf("%d %s", status, msg), true
+		case status > 0:
+			return "error", fmt.Sprintf("HTTP %d", status), true
+		case msg != "":
+			return "error", msg, true
+		}
+		return "error", "request failed", true
+	}
+
+	if e.Content != "" {
+		return "system", e.Content, true
+	}
+	return "", "", false
+}
+
+// truncateSystemBody folds a body onto one line and caps its length.
+func truncateSystemBody(s string) string {
+	full := collapseWhitespace(s, 0)
+	runes := []rune(full)
+	if len(runes) <= maxSystemBodyLen {
+		return full
+	}
+	return string(runes[:maxSystemBodyLen]) + "\u2026"
+}
+
+// extractCommandName pulls the command out of a local_command system entry,
+// whose content is "<command-name>/clear</command-name>". Anything else is
+// returned unchanged.
+func extractCommandName(content string) string {
+	if idx := strings.Index(content, "<command-name>"); idx >= 0 {
+		start := idx + len("<command-name>")
+		if end := strings.Index(content[start:], "</command-name>"); end >= 0 {
+			return content[start : start+end]
+		}
+	}
+	return content
+}
+
+// parseSystemError digs the HTTP status and message out of an api_error
+// payload. Either half can be missing: some failures carry only a status, and
+// one observed shape carries only a type.
+func parseSystemError(raw json.RawMessage) (status int, msg string) {
+	if len(raw) == 0 {
+		return 0, ""
+	}
+	var payload struct {
+		Status int             `json:"status"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0, ""
+	}
+	return payload.Status, errorMessage(payload.Error)
+}
+
+// errorMessage digs the message out of an error payload. The nesting differs by
+// producer: the router writes {"message": ...} while the API client wraps it as
+// {"error": {"message": ...}}, so walk down until a message shows up.
+func errorMessage(raw json.RawMessage) string {
+	for depth := 0; depth < 3 && len(raw) > 0; depth++ {
+		var level struct {
+			Message string          `json:"message"`
+			Error   json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(raw, &level); err != nil {
+			return ""
+		}
+		if level.Message != "" {
+			return level.Message
+		}
+		raw = level.Error
+	}
+	return ""
+}
+
+// formatDurationMs renders a millisecond duration compactly: 950ms, 59s,
+// 10m47s, 2h05m.
+func formatDurationMs(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	d := time.Duration(ms) * time.Millisecond
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// collapseWhitespace folds every whitespace run into a single space, drops
+// other control characters, trims the edges, and truncates to max runes (max
+// <= 0 means no limit). Shared by paste handling and system entry rendering,
+// both of which must turn multi-line text into one line.
+func collapseWhitespace(s string, max int) string {
+	var b strings.Builder
+	pendingSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if b.Len() > 0 {
+				pendingSpace = true
+			}
+			continue
+		}
+		if r < 32 || r == 127 {
+			continue // drop other control characters
+		}
+		if pendingSpace {
+			b.WriteRune(' ')
+			pendingSpace = false
+		}
+		b.WriteRune(r)
+	}
+	out := b.String()
+	if max > 0 {
+		if runes := []rune(out); len(runes) > max {
+			out = string(runes[:max])
+		}
+	}
+	return out
 }
 
 func readFileContent(path string) (string, error) {

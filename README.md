@@ -156,6 +156,10 @@ For full conversations with sub-agents, HTML export creates a directory with `in
 | `n` / `N` | Next / previous match |
 | `Esc` | Clear search |
 | `Tab` / `h` | Switch to sidebar |
+| `t` | Toggle tool call detail |
+| `T` | Toggle thinking blocks |
+| `R` | Toggle tool results |
+| `S` | Toggle system entries (command output, compaction, errors) |
 | `e` | Export wizard |
 | `o` | Open in `$EDITOR` |
 | `q` | Quit |
