@@ -50,7 +50,7 @@ main.go (CLI flags, mode dispatch)
 
 ### Key Types
 
-- **`Provider`** (`provider.go`): Interface abstracting data sources — `LoadTree()`, `LoadConversation()`, `SearchSessions()`
+- **`Provider`** (`provider.go`): Interface abstracting data sources — `Name()`, `Available()`, `LoadTree()`, `LoadProjectList()`, `EnrichProjectMeta()`, `LoadProjectDetail()`, `LoadConversation()`, `ContentSearch()`. `ContentSearch` returns a `ContentSearchResult`: complete results plus the `ContentMatch` windows prefix narrowing needs.
 - **`TreeData`** (`data.go`): Hierarchical structure of projects → conversations → sub-agents
 - **`Entry`** (`parse.go`): Single JSONL line — has `Type` (user/assistant/system), `Parsed` message, and content blocks
 - **`model`** (`ui.go`): Bubble Tea model — holds all TUI state (view state, sidebar, content, search, export overlay, mouse selection)
@@ -60,7 +60,7 @@ main.go (CLI flags, mode dispatch)
 | File | Purpose |
 |------|---------|
 | `main.go` | CLI flag parsing, mode dispatch (TUI/web/export) |
-| `provider.go` | `Provider` interface + `SearchResult` type |
+| `provider.go` | `Provider` interface + `SearchResult` / `ContentSearchResult` / `ContentMatch` types + `contentWindows()` |
 | `provider_claude.go` | Claude Code provider — reads `~/.claude/` directory tree |
 | `provider_opencode.go` | OpenCode provider — reads SQLite DB via `modernc.org/sqlite` (pure Go, no CGO) |
 | `data.go` | Tree loading for Claude (`loadTree`, `loadProject`, `findSubAgents`), file/dir helpers |
@@ -72,7 +72,7 @@ main.go (CLI flags, mode dispatch)
 ## Key Patterns
 
 ### Provider Pattern
-The `Provider` interface decouples data sources from UI. Claude reads filesystem JSONL files; OpenCode reads a SQLite database. Both return the same `TreeData`/`Entry` types. Adding a new provider means implementing the 5-method interface.
+The `Provider` interface decouples data sources from UI. Claude reads filesystem JSONL files; OpenCode reads a SQLite database. Both return the same `TreeData`/`Entry` types. A new provider implements the 8 methods above; `ContentSearch` carries the heaviest contract, see [Content Search Prefix Narrowing](#content-search-prefix-narrowing).
 
 ### Lazy Loading (3-Level Hierarchy)
 The Claude provider uses a 3-level lazy loading strategy to avoid scanning all JSONL files at startup. See `docs/adr/001-lazy-loading.md` for the full design.
@@ -97,7 +97,17 @@ Both providers normalize their data into `ContentBlock` with types: `text`, `thi
 Entries with `type: "system"` (harness metadata: command output, compaction, turn durations, API errors) are formatted by `formatSystemEntry()` in `parse.go`, which returns a `(label, body)` pair. It is the single source of truth for all four surfaces — TUI (`renderConversation`), HTML export (`export.go`, 2 call sites), Markdown export, and the web UI (`serveMessages`) — so a subtype only ever needs formatting in one place. Unknown subtypes with content fall through to a generic rendering, because the set of subtypes grows with each Claude Code release. Fields the formatter needs (`Error`, `DurationMs`, `MessageCount`, `CompactMetadata`) are parsed into `Entry`; an unparsed field silently renders as missing.
 
 ### Debounced Search
-Content search and session search use a generation-counter debounce pattern. Each keypress increments `contentSearchGen`/`sessionSearch.gen`; a `tea.Tick` fires after delay and only the latest generation triggers the actual search.
+`contentSearchGen` (in-viewer `/` search) and `sessionSearch.gen` use a generation-counter debounce: each keypress increments the counter, a `tea.Tick` fires after the delay, and only the latest generation triggers the search. Metadata search still works this way; content search deliberately does not — see below.
+
+### Content Search Prefix Narrowing
+Content search is the only search that touches the disk (`rg`/`grep` per keystroke, or a scan of the OpenCode `part` table), so it is **gated**: typing never searches, `Enter` (or a scope/mode change) does, and afterwards typing narrows the previous search's result set locally. `sessionSearchState` holds the base (`baseQuery`, `baseAll`, `matches`, `narrowable`, `pending`, `incomplete`) and `applyQueryToSearchCache()` implements the three cases — query extends the base (narrow), query is a proper prefix of the base (base results are valid but incomplete, shown with a marker), otherwise diverged (show nothing).
+
+The cache is `ContentMatch.Windows`: per matching line, the text from its first match to 50 runes past its last one. This is what makes narrowing exact rather than approximate — a result may still contain the longer query after its window has run out, and a result whose window cannot answer cannot be shown at all, because the base's results are a superset once the query grows. Two invariants keep it sound, and breaking either loses matches silently:
+
+- **Every occurrence in the line must be inside its window.** A line like `ac ab` must match base `a` extended to `ab` from its *second* occurrence, so windows are built from first match to last match, never from the first match alone.
+- **All or nothing under the budget.** `budgetedMatches()` drops the entire window set when it exceeds `searchCacheBudgetBytes` (`--search-cache-mb`, `CCVIEW_SEARCH_CACHE_MB`, default 32MB). Caching what fits would make narrowing miss matches.
+
+Beyond `contentMatchWindowRunes` of growth, or without windows, narrowing is unavailable and the UI asks for `enter to search again`. Providers must therefore return **complete** results (no SQL `LIMIT`) and match the query **literally and case-sensitively** — `rg -F`, `instr()`, `strings.Contains` — because a backend whose rule differs would make narrowing disagree with the search that produced its windows. The 50-result display cap lives in `setSearchResults()`, not in the providers.
 
 ### Embedded Web UI
 The web UI HTML/CSS/JS is a single const string (`indexHTML` in `server.go`) — not a separate file. Highlight.js is loaded from CDN.
@@ -118,6 +128,7 @@ The project list screen has an inline filter (`f` key) that narrows projects by 
 - **`model.directFile`** — when a file is passed via `--file`, the TUI skips provider loading and goes straight to content view. Many code paths check for this.
 - **Lazy loading state** — `model.projectDetailLoading` is true while Level 2 is loading for a project. The sidebar shows a "Loading..." header during this time. The `projectDetailReadyMsg` handler rebuilds the sidebar when data arrives.
 - **Web server API** — the web mode's `/api/tree` endpoint only loads Claude data (calls `loadTree()` directly, not through providers). OpenCode data is not served via web mode.
+- **Content search truncation** — the complete match set is `sessionSearch.allResults`; `sessionSearch.results` is its first `searchDisplayLimit` entries. Never cap in a provider or in `computeContentSearchResults`: narrowing works off the complete set, so a truncating provider makes a narrowed search miss matches past the cap.
 - **Paste** — bracketed paste is enabled (nothing sets `DisableBracketedPasteMode` on the `tea.View`), so pasted text arrives as `tea.PasteMsg`, **never** as a run of `tea.KeyPressMsg`. Every text input must be routed in `handlePaste()`; adding a new text input without a case there means it silently ignores pastes. Text is normalized by `sanitizePaste()` (whitespace runs collapse to one space, control characters dropped, capped at `maxPasteLen`).
 - **Display toggles are TUI-only** — `t` / `T` / `R` / `S` change what the viewer renders, and nothing else. Export (HTML, Markdown) and the web UI always render everything, because they are the complete record. Do not make export honour a toggle to "fix" the inconsistency.
 - **`showSystem` defaults to on** — unlike the other display toggles, which rely on the zero value, `showSystem` is initialized in `newModel()`. Building a `model` literal without it (as tests do) yields a viewer with system entries hidden.

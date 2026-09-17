@@ -154,6 +154,8 @@ For full conversations with sub-agents, HTML export creates a directory with `in
 | `g` / `G` | Jump to top/bottom |
 | `/` | Search content |
 | `n` / `N` | Next / previous match |
+| `[` / `]` | Previous / next turn |
+| `\` | Jump to a turn: `\` then the number, then `Enter` |
 | `Esc` | Clear search |
 | `Tab` / `h` | Switch to sidebar |
 | `t` | Toggle tool call detail |
@@ -168,10 +170,14 @@ For full conversations with sub-agents, HTML export creates a directory with `in
 
 | Key | Action |
 |-----|--------|
+| `alt+t` / `alt+c` | Search titles (as you type) or conversation content |
 | `tab` | Toggle global / project scope |
 | `j` / `k` | Navigate results |
-| `Enter` | Open selected session |
+| `Enter` | Search the content query, or open the selected session |
+| `alt+f` | Filter the sidebar to the results |
 | `Esc` | Close overlay |
+
+Title search filters the loaded conversations as you type. Content search reads every conversation on disk, so it waits for `Enter` — after that, typing narrows the results locally, without searching again, until the query has grown 50 characters past the one you searched for. Then `Enter` searches again. The overlay says `enter to search again` whenever the list does not match what is typed.
 
 ## What it reads
 
