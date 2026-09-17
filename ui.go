@@ -51,16 +51,26 @@ const (
 )
 
 type sessionSearchState struct {
-	active        bool
-	scope         searchScope
-	input         []rune
-	results       []SearchResult
+	active  bool
+	scope   searchScope
+	input   []rune
+	results []SearchResult // capped view of allResults, for display and navigation
+	// allResults is the complete match set. results is its first
+	// searchDisplayLimit entries, so the two share a prefix and a cursor into
+	// results is also a cursor into allResults.
+	allResults    []SearchResult
+	matches       []ContentMatch // match windows, used to narrow to a longer query
 	cursor        int
 	offset        int
 	gen           int  // debounce generation — only the latest tick fires search
 	contentSearch bool // true = search conversation content, false = search metadata only
 	searching     bool // true while rg/grep is running
 }
+
+// searchDisplayLimit caps how many results the overlay lists. The full match
+// set is kept in allResults, so narrowing to a longer query can still reach
+// matches that fall past the cap.
+const searchDisplayLimit = 50
 
 // ── Model ──
 
@@ -237,7 +247,7 @@ type historyTitlesLoadedMsg struct {
 
 type contentSearchDoneMsg struct {
 	gen     int
-	results []SearchResult
+	results ContentSearchResult
 }
 
 // ── Styles ──
@@ -705,7 +715,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case contentSearchDoneMsg:
 		// Async content search completed
 		if msg.gen == m.sessionSearch.gen {
-			m.sessionSearch.results = msg.results
+			m.sessionSearch.matches = msg.results.Matches
+			m.setSearchResults(msg.results.Results)
 		}
 		m.sessionSearch.searching = false
 		return m, nil
@@ -1709,47 +1720,6 @@ func (m *model) computeSessionSearchResults() {
 	q := strings.ToLower(query)
 	var allResults []SearchResult
 
-	// Content search mode: use rg/grep to find matching files
-	if m.sessionSearch.contentSearch {
-		home, _ := os.UserHomeDir()
-		claudeDir := filepath.Join(home, ".claude")
-		matchedFiles := searchContentInFiles(query, claudeDir)
-		if matchedFiles != nil {
-			for pi, tree := range m.providerTrees {
-				if tree == nil {
-					continue
-				}
-				for i, proj := range tree.Projects {
-					if m.sessionSearch.scope == searchScopeProject && m.currentProj != nil && proj.DirName != m.currentProj.DirName {
-						continue
-					}
-					for _, conv := range proj.Conversations {
-						if matchedFiles[conv.Path] {
-							allResults = append(allResults, SearchResult{
-								Source:      proj.Source,
-								ProjectName: proj.DisplayName,
-								Title:       conv.Title,
-								Preview:     conv.Preview,
-								Path:        conv.Path,
-								ModTime:     conv.ModTime,
-								ProjIndex:   i,
-								MsgCount:    conv.MsgCount,
-								CWD:         conv.CWD,
-							})
-						}
-					}
-					_ = pi
-				}
-			}
-		}
-		sortSearchResults(allResults)
-		if len(allResults) > 50 {
-			allResults = allResults[:50]
-		}
-		m.sessionSearch.results = allResults
-		return
-	}
-
 	// Metadata search mode: search title/preview/slug/project name
 	if m.sessionSearch.scope == searchScopeProject && m.currentProj != nil {
 		// Project scope: search current project's conversations in the cached tree
@@ -1802,32 +1772,42 @@ func (m *model) computeSessionSearchResults() {
 			}
 		}
 	}
-	sortSearchResults(allResults)
+	m.setSearchResults(allResults)
+	m.sessionSearch.matches = nil
+}
 
-	// Limit results
-	if len(allResults) > 50 {
-		allResults = allResults[:50]
+// setSearchResults records the complete match set and derives the capped view
+// the overlay displays and navigates.
+func (m *model) setSearchResults(all []SearchResult) {
+	sortSearchResults(all)
+	m.sessionSearch.allResults = all
+	if len(all) > searchDisplayLimit {
+		all = all[:searchDisplayLimit]
 	}
-	m.sessionSearch.results = allResults
+	m.sessionSearch.results = all
 }
 
 // computeContentSearchResults runs content search via providers (called from async goroutine).
-func computeContentSearchResults(query string, scope searchScope, providers []Provider, tabIdx int, currentDirName string) []SearchResult {
-	var allResults []SearchResult
+func computeContentSearchResults(query string, scope searchScope, providers []Provider, tabIdx int, currentDirName string) ContentSearchResult {
+	var out ContentSearchResult
+	matchesByPath := make(map[string]int)
 	for _, prov := range providers {
 		projectID := ""
 		if scope == searchScopeProject && currentDirName != "" {
 			projectID = currentDirName
 		}
-		results := prov.ContentSearch(query, projectID)
-		allResults = append(allResults, results...)
+		res := prov.ContentSearch(query, projectID)
+		out.Results = append(out.Results, res.Results...)
+		for _, cm := range res.Matches {
+			if idx, ok := matchesByPath[cm.Path]; ok {
+				out.Matches[idx].Windows = append(out.Matches[idx].Windows, cm.Windows...)
+				continue
+			}
+			matchesByPath[cm.Path] = len(out.Matches)
+			out.Matches = append(out.Matches, cm)
+		}
 	}
-
-	sortSearchResults(allResults)
-	if len(allResults) > 50 {
-		allResults = allResults[:50]
-	}
-	return allResults
+	return out
 }
 
 // matchConversation checks if a conversation matches the search query against metadata fields.
@@ -1846,9 +1826,11 @@ func searchContentInFiles(query string, claudeDir string) map[string]bool {
 	matches := make(map[string]bool)
 	searchDir := filepath.Join(claudeDir, "projects")
 
-	// Try rg first, then grep
+	// Try rg first, then grep. Both are asked for fixed strings (-F): the
+	// query is a literal on every backend, which keeps prefix narrowing sound
+	// and stops '[' or '(' from failing over to a different matcher.
 	if rgPath, err := exec.LookPath("rg"); err == nil {
-		cmd := exec.Command(rgPath, "-l", query, searchDir)
+		cmd := exec.Command(rgPath, "-l", "-F", query, searchDir)
 		out, err := cmd.Output()
 		if err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -1865,7 +1847,7 @@ func searchContentInFiles(query string, claudeDir string) map[string]bool {
 	}
 
 	if grepPath, err := exec.LookPath("grep"); err == nil {
-		cmd := exec.Command(grepPath, "-rl", query, searchDir)
+		cmd := exec.Command(grepPath, "-rl", "-F", query, searchDir)
 		out, err := cmd.Output()
 		if err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -1881,8 +1863,8 @@ func searchContentInFiles(query string, claudeDir string) map[string]bool {
 		}
 	}
 
-	// Manual fallback: walk projects dir and scan each JSONL file
-	q := strings.ToLower(query)
+	// Manual fallback: walk projects dir and scan each JSONL file. Case-sensitive
+	// for the same reason as -F above.
 	filepath.Walk(searchDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
@@ -1895,7 +1877,7 @@ func searchContentInFiles(query string, claudeDir string) map[string]bool {
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 0), 1024*1024)
 		for scanner.Scan() {
-			if strings.Contains(strings.ToLower(scanner.Text()), q) {
+			if strings.Contains(scanner.Text(), query) {
 				matches[filepath.Clean(path)] = true
 				break
 			}

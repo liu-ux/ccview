@@ -497,47 +497,44 @@ func capitalizeToolName(name string) string {
 	return name
 }
 
-func (p *OpenCodeProvider) ContentSearch(query string, projectID string) []SearchResult {
+func (p *OpenCodeProvider) ContentSearch(query string, projectID string) ContentSearchResult {
+	if query == "" {
+		return ContentSearchResult{}
+	}
 	db, err := p.openDB()
 	if err != nil {
-		return nil
+		return ContentSearchResult{}
 	}
 	defer db.Close()
 
-	q := "%" + query + "%"
-	var rows *sql.Rows
+	// instr() rather than LIKE: LIKE is case-insensitive for ASCII and treats
+	// % and _ as wildcards, neither of which matches the literal, case-sensitive
+	// query the other backends use. There is deliberately no LIMIT — the caller
+	// truncates for display, and prefix narrowing needs the whole match set.
+	const sessionQuery = `
+			SELECT DISTINCT s.id, s.title, p.worktree, p.name, s.time_updated
+			FROM part pt
+			JOIN message m ON pt.message_id = m.id
+			JOIN session s ON m.session_id = s.id
+			JOIN project p ON s.project_id = p.id
+			WHERE s.parent_id IS NULL AND s.time_archived IS NULL`
 
+	var rows *sql.Rows
 	if projectID != "" {
-		rows, err = db.Query(`
-			SELECT DISTINCT s.id, s.title, p.worktree, p.name, s.time_updated
-			FROM part pt
-			JOIN message m ON pt.message_id = m.id
-			JOIN session s ON m.session_id = s.id
-			JOIN project p ON s.project_id = p.id
-			WHERE s.project_id = ? AND s.parent_id IS NULL AND s.time_archived IS NULL
-			  AND pt.data LIKE ?
-			ORDER BY s.time_updated DESC
-			LIMIT 50
-		`, projectID, q)
+		rows, err = db.Query(sessionQuery+`
+			  AND s.project_id = ? AND instr(pt.data, ?) > 0
+			ORDER BY s.time_updated DESC`, projectID, query)
 	} else {
-		rows, err = db.Query(`
-			SELECT DISTINCT s.id, s.title, p.worktree, p.name, s.time_updated
-			FROM part pt
-			JOIN message m ON pt.message_id = m.id
-			JOIN session s ON m.session_id = s.id
-			JOIN project p ON s.project_id = p.id
-			WHERE s.parent_id IS NULL AND s.time_archived IS NULL
-			  AND pt.data LIKE ?
-			ORDER BY s.time_updated DESC
-			LIMIT 50
-		`, q)
+		rows, err = db.Query(sessionQuery+`
+			  AND instr(pt.data, ?) > 0
+			ORDER BY s.time_updated DESC`, query)
 	}
 	if err != nil {
-		return nil
+		return ContentSearchResult{}
 	}
 	defer rows.Close()
 
-	var results []SearchResult
+	var out ContentSearchResult
 	for rows.Next() {
 		var (
 			sid, title string
@@ -552,7 +549,7 @@ func (p *OpenCodeProvider) ContentSearch(query string, projectID string) []Searc
 		if projName.Valid && projName.String != "" {
 			displayName = projName.String
 		}
-		results = append(results, SearchResult{
+		out.Results = append(out.Results, SearchResult{
 			Source:      "opencode",
 			ProjectName: displayName,
 			Title:       title,
@@ -560,7 +557,47 @@ func (p *OpenCodeProvider) ContentSearch(query string, projectID string) []Searc
 			ModTime:     time.UnixMilli(updated).Format(time.RFC3339),
 		})
 	}
-	return results
+	if err := rows.Err(); err != nil {
+		return out
+	}
+	rows.Close()
+
+	// Second pass over the same match set to keep the windows a narrowed search
+	// needs, keyed by session so they line up with the results above.
+	const partQuery = `
+			SELECT m.session_id, pt.data
+			FROM part pt
+			JOIN message m ON pt.message_id = m.id
+			JOIN session s ON m.session_id = s.id
+			WHERE s.parent_id IS NULL AND s.time_archived IS NULL`
+
+	var partRows *sql.Rows
+	if projectID != "" {
+		partRows, err = db.Query(partQuery+`
+			  AND s.project_id = ? AND instr(pt.data, ?) > 0`, projectID, query)
+	} else {
+		partRows, err = db.Query(partQuery+`
+			  AND instr(pt.data, ?) > 0`, query)
+	}
+	if err != nil {
+		return out
+	}
+	defer partRows.Close()
+
+	windows := make(map[string][]string)
+	for partRows.Next() {
+		var sid, data string
+		if err := partRows.Scan(&sid, &data); err != nil {
+			continue
+		}
+		windows[sid] = append(windows[sid], contentWindows(data, query)...)
+	}
+	for _, r := range out.Results {
+		if w := windows[r.Path]; len(w) > 0 {
+			out.Matches = append(out.Matches, ContentMatch{Path: r.Path, Windows: w})
+		}
+	}
+	return out
 }
 
 // sortSearchResults sorts results by modification time (newest first).

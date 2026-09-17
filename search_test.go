@@ -48,7 +48,9 @@ func TestSearchContentInFiles_ManualFallback(t *testing.T) {
 	}
 }
 
-func TestSearchContentInFiles_CaseInsensitive(t *testing.T) {
+// The query is literal and case-sensitive on every backend, so that a narrowed
+// search can never disagree with the search that produced its windows.
+func TestSearchContentInFiles_IsCaseSensitiveAndLiteral(t *testing.T) {
 	tmpHome := t.TempDir()
 	claudeDir := filepath.Join(tmpHome, ".claude")
 	projDir := filepath.Join(claudeDir, "projects", "proj")
@@ -56,18 +58,27 @@ func TestSearchContentInFiles_CaseInsensitive(t *testing.T) {
 
 	os.WriteFile(filepath.Join(projDir, "a.jsonl"), []byte(
 		`{"type":"user","content":"TypeError: Cannot read property"}`), 0644)
+	os.WriteFile(filepath.Join(projDir, "b.jsonl"), []byte(
+		`{"type":"user","content":"value is 50% of total"}`), 0644)
 
 	origPath := os.Getenv("PATH")
 	os.Setenv("PATH", "")
 	defer os.Setenv("PATH", origPath)
 
-	matches := searchContentInFiles("typeerror", claudeDir)
-	if matches == nil {
-		t.Fatal("searchContentInFiles returned nil")
-	}
 	aPath := filepath.Clean(filepath.Join(projDir, "a.jsonl"))
-	if !matches[aPath] {
-		t.Error("should match case-insensitively")
+	bPath := filepath.Clean(filepath.Join(projDir, "b.jsonl"))
+
+	if matches := searchContentInFiles("typeerror", claudeDir); matches[aPath] {
+		t.Error("lowercase query must not match TypeError: matching is case-sensitive")
+	}
+	if matches := searchContentInFiles("TypeError", claudeDir); !matches[aPath] {
+		t.Error("exact-case query should match")
+	}
+	if matches := searchContentInFiles("50% of", claudeDir); !matches[bPath] {
+		t.Error("% must be matched literally, not as a wildcard")
+	}
+	if matches := searchContentInFiles("50.", claudeDir); matches[bPath] {
+		t.Error(". must be matched literally, not as a regex metacharacter")
 	}
 }
 
@@ -113,7 +124,7 @@ func TestComputeContentSearchResults_MatchesTreeConversations(t *testing.T) {
 	projDir := filepath.Join(claudeDir, "projects", "my-project")
 	os.MkdirAll(projDir, 0755)
 
-	os.WriteFile(filepath.Join(projDir, "aaa.jsonl"), []byte(`{"content":"TypeError in auth module"}`), 0644)
+	os.WriteFile(filepath.Join(projDir, "aaa.jsonl"), []byte(`{"content":"typeerror in auth module"}`), 0644)
 	os.WriteFile(filepath.Join(projDir, "bbb.jsonl"), []byte(`{"content":"nothing relevant"}`), 0644)
 
 	// Set HOME so ContentSearch finds our test data
@@ -132,7 +143,7 @@ func TestComputeContentSearchResults_MatchesTreeConversations(t *testing.T) {
 	defer os.Setenv("PATH", origPath)
 
 	providers := []Provider{&ClaudeProvider{}}
-	results := computeContentSearchResults("typeerror", searchScopeGlobal, providers, 0, "")
+	results := computeContentSearchResults("typeerror", searchScopeGlobal, providers, 0, "").Results
 	if len(results) == 0 {
 		t.Fatal("expected at least 1 result, got 0")
 	}
@@ -179,7 +190,7 @@ func TestComputeContentSearchResults_ProjectScope(t *testing.T) {
 
 	// Project scope: only search proj-a
 	providers := []Provider{&ClaudeProvider{}}
-	results := computeContentSearchResults("needle", searchScopeProject, providers, 0, "proj-a")
+	results := computeContentSearchResults("needle", searchScopeProject, providers, 0, "proj-a").Results
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result in project scope, got %d", len(results))
 	}
@@ -357,5 +368,28 @@ func TestPaste_EmptyIsNoOp(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("expected no command for an empty paste")
+	}
+}
+
+// Same contract as the manual fallback, but through the real rg/grep path. If
+// neither is installed this still passes, since all three backends now agree.
+func TestSearchContentInFiles_LiteralThroughRg(t *testing.T) {
+	tmpHome := t.TempDir()
+	claudeDir := filepath.Join(tmpHome, ".claude")
+	projDir := filepath.Join(claudeDir, "projects", "proj")
+	os.MkdirAll(projDir, 0755)
+
+	os.WriteFile(filepath.Join(projDir, "dotted.jsonl"), []byte(`{"content":"a.c is literal"}`), 0644)
+	os.WriteFile(filepath.Join(projDir, "abc.jsonl"), []byte(`{"content":"abc is not"}`), 0644)
+
+	dotted := filepath.Clean(filepath.Join(projDir, "dotted.jsonl"))
+	abc := filepath.Clean(filepath.Join(projDir, "abc.jsonl"))
+
+	matches := searchContentInFiles("a.c", claudeDir)
+	if !matches[dotted] {
+		t.Error("literal query should match the file containing it")
+	}
+	if matches[abc] {
+		t.Error(". must not act as a regex wildcard")
 	}
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -924,5 +926,159 @@ func TestExportSurfaces_RenderSystemEntries(t *testing.T) {
 				t.Errorf("%s export missing %q", name, w)
 			}
 		}
+	}
+}
+
+// ── Content match windows ──
+
+func TestContentWindows(t *testing.T) {
+	// A window starts at the line's first match and ends 50 runes past its last
+	// match, so every occurrence in the line stays inside it.
+	line := "head needle tail needle end"
+	windows := contentWindows(line, "needle")
+	if len(windows) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(windows))
+	}
+	if windows[0] != line[len("head "):] {
+		t.Errorf("window = %q, want the line from the first match", windows[0])
+	}
+	if !strings.Contains(windows[0], "needle end") {
+		t.Errorf("window must contain the last occurrence: %q", windows[0])
+	}
+}
+
+func TestContentWindows_ClampsToLineEnd(t *testing.T) {
+	line := "abc needle"
+	if got := contentWindows(line, "needle"); len(got) != 1 || got[0] != "needle" {
+		t.Errorf("window = %q, want %q (no text past the line end)", got, "needle")
+	}
+}
+
+func TestContentWindows_TruncatesToWindowRunes(t *testing.T) {
+	gap := strings.Repeat("x", contentMatchWindowRunes+40)
+	line := "needle" + gap + "needle" + strings.Repeat("y", 100)
+	got := contentWindows(line, "needle")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(got))
+	}
+	want := len("needle") + len(gap) + len("needle") + contentMatchWindowRunes
+	if n := len([]rune(got[0])); n != want {
+		t.Errorf("window is %d runes, want %d", n, want)
+	}
+	if n := strings.Count(got[0], "y"); n != contentMatchWindowRunes {
+		t.Errorf("window keeps %d of the 100 trailing y's, want exactly %d", n, contentMatchWindowRunes)
+	}
+	if !strings.Contains(got[0], gap+"needle") {
+		t.Errorf("window must reach the last occurrence: %q", got[0])
+	}
+}
+
+func TestContentWindows_MultiByteIsRuneSafe(t *testing.T) {
+	// 50 runes, not 50 bytes: otherwise a Chinese line would keep only ~16 chars.
+	line := "前缀中文关键词" + strings.Repeat("中", 200)
+	got := contentWindows(line, "关键词")
+	if len(got) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(got))
+	}
+	if n := len([]rune(got[0])); n != len([]rune("关键词"))+contentMatchWindowRunes {
+		t.Errorf("window is %d runes, want %d", n, len([]rune("关键词"))+contentMatchWindowRunes)
+	}
+	if got[0][0:len("关键词")] != "关键词" {
+		t.Errorf("window must start at the match: %q", got[0])
+	}
+}
+
+func TestContentWindows_MultipleLinesAndNoMatch(t *testing.T) {
+	text := "no match here\nhas needle once\nplain\nneedle again"
+	got := contentWindows(text, "needle")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 windows, got %d: %q", len(got), got)
+	}
+	if got[0] != "needle once" || got[1] != "needle again" {
+		t.Errorf("unexpected windows: %q", got)
+	}
+	if w := contentWindows("nothing", "needle"); w != nil {
+		t.Errorf("expected nil for no match, got %q", w)
+	}
+	if w := contentWindows("anything", ""); w != nil {
+		t.Errorf("expected nil for an empty query, got %q", w)
+	}
+}
+
+// ── OpenCode content search ──
+
+// openCodeFixture builds a minimal OpenCode database with n sessions, each
+// holding one message part containing needle.
+func openCodeFixture(t *testing.T, n int, needle string) string {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "opencode.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open fixture db: %v", err)
+	}
+	defer db.Close()
+
+	stmts := []string{
+		`CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT)`,
+		`CREATE TABLE session (id TEXT PRIMARY KEY, title TEXT, project_id TEXT, parent_id TEXT, time_archived INTEGER, time_updated INTEGER)`,
+		`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT)`,
+		`CREATE TABLE part (message_id TEXT, data TEXT)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("schema: %v", err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO project (id, worktree, name) VALUES ('p1', '/tmp/proj', 'proj')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	for i := 0; i < n; i++ {
+		sid := fmt.Sprintf("ses_%03d", i)
+		if _, err := db.Exec(`INSERT INTO session (id, title, project_id, time_updated) VALUES (?, ?, 'p1', ?)`,
+			sid, "title "+sid, int64(1000+i)); err != nil {
+			t.Fatalf("insert session: %v", err)
+		}
+		mid := "msg_" + sid
+		if _, err := db.Exec(`INSERT INTO message (id, session_id) VALUES (?, ?)`, mid, sid); err != nil {
+			t.Fatalf("insert message: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO part (message_id, data) VALUES (?, ?)`,
+			mid, `{"type":"text","text":"`+needle+` and more after it"}`); err != nil {
+			t.Fatalf("insert part: %v", err)
+		}
+	}
+	return dbPath
+}
+
+// The provider must not truncate: prefix narrowing works off the complete set,
+// and the display cap is the caller's business.
+func TestOpenCodeContentSearch_ReturnsCompleteResults(t *testing.T) {
+	const sessions = 55 // well past the old SQL LIMIT 50
+	p := &OpenCodeProvider{dbPath: openCodeFixture(t, sessions, "needle")}
+
+	got := p.ContentSearch("needle", "")
+	if len(got.Results) != sessions {
+		t.Errorf("results = %d, want %d (search must not truncate)", len(got.Results), sessions)
+	}
+	if len(got.Matches) != sessions {
+		t.Fatalf("matches = %d, want %d", len(got.Matches), sessions)
+	}
+	for _, m := range got.Matches {
+		if len(m.Windows) == 0 {
+			t.Fatalf("match for %s has no windows", m.Path)
+		}
+		if !strings.Contains(m.Windows[0], "needle") {
+			t.Errorf("window %q does not contain the query", m.Windows[0])
+		}
+	}
+}
+
+func TestOpenCodeContentSearch_IsCaseSensitiveAndLiteral(t *testing.T) {
+	p := &OpenCodeProvider{dbPath: openCodeFixture(t, 1, "50% off")}
+	if got := p.ContentSearch("Needle", ""); len(got.Results) != 0 || len(got.Matches) != 0 {
+		t.Errorf("lower-case query must not match: %+v", got)
+	}
+	if got := p.ContentSearch("50% o", ""); len(got.Results) != 1 {
+		t.Errorf("%% must be literal, not a wildcard: %+v", got.Results)
 	}
 }

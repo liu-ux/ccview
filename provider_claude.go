@@ -51,21 +51,21 @@ func (p *ClaudeProvider) LoadConversation(path string) ([]Entry, error) {
 	return parseConversation(path)
 }
 
-func (p *ClaudeProvider) ContentSearch(query string, projectID string) []SearchResult {
+func (p *ClaudeProvider) ContentSearch(query string, projectID string) ContentSearchResult {
 	home, _ := os.UserHomeDir()
 	claudeDir := filepath.Join(home, ".claude")
 	matchedFiles := searchContentInFiles(query, claudeDir)
 	if len(matchedFiles) == 0 {
-		return nil
+		return ContentSearchResult{}
 	}
 
 	projectsDir := filepath.Join(claudeDir, "projects")
 	projEntries, err := os.ReadDir(projectsDir)
 	if err != nil {
-		return nil
+		return ContentSearchResult{}
 	}
 
-	var results []SearchResult
+	var out ContentSearchResult
 	for _, pe := range projEntries {
 		if !pe.IsDir() {
 			continue
@@ -88,13 +88,24 @@ func (p *ClaudeProvider) ContentSearch(query string, projectID string) []SearchR
 			if len(title) > 8 {
 				title = title[:8]
 			}
-			results = append(results, SearchResult{
+			out.Results = append(out.Results, SearchResult{
 				Source:      "claude",
 				ProjectName: pe.Name(),
 				Title:       title,
 				Path:        convPath,
 			})
+
+			// rg only reports which files matched. Read each one back to keep
+			// the windows a narrowed search needs; matching here must stay
+			// literal and case-sensitive to agree with rg -F.
+			data, err := os.ReadFile(convPath)
+			if err != nil {
+				continue
+			}
+			if windows := contentWindows(string(data), query); len(windows) > 0 {
+				out.Matches = append(out.Matches, ContentMatch{Path: convPath, Windows: windows})
+			}
 		}
 	}
-	return results
+	return out
 }
