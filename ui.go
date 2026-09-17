@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -55,22 +56,54 @@ type sessionSearchState struct {
 	scope   searchScope
 	input   []rune
 	results []SearchResult // capped view of allResults, for display and navigation
-	// allResults is the complete match set. results is its first
-	// searchDisplayLimit entries, so the two share a prefix and a cursor into
-	// results is also a cursor into allResults.
-	allResults    []SearchResult
-	matches       []ContentMatch // match windows, used to narrow to a longer query
-	cursor        int
-	offset        int
-	gen           int  // debounce generation — only the latest tick fires search
+	// allResults is the complete match set for the current query. results is
+	// its first searchDisplayLimit entries, so the two share a prefix and a
+	// cursor into results is also a cursor into allResults.
+	allResults []SearchResult
+	cursor     int
+	offset     int
+	gen        int  // debounce generation — only the latest tick fires search
 	contentSearch bool // true = search conversation content, false = search metadata only
 	searching     bool // true while rg/grep is running
+
+	// Prefix narrowing state, for content search only. base* describes the last
+	// full search; typing narrows it locally instead of searching again.
+	baseQuery  string           // query the base search ran for; "" = none yet
+	baseAll    []SearchResult   // complete results of baseQuery
+	matches    []ContentMatch   // windows, kept only when they fit the budget
+	narrowable bool             // false when the windows were dropped (budget)
+	pending    bool             // the current query has not been searched: enter searches
+	incomplete bool             // showing baseAll, which a shorter query widens
 }
 
 // searchDisplayLimit caps how many results the overlay lists. The full match
 // set is kept in allResults, so narrowing to a longer query can still reach
 // matches that fall past the cap.
 const searchDisplayLimit = 50
+
+// defaultSearchCacheMB is the total size of the match windows the overlay may
+// keep for prefix narrowing. Overridable with CCVIEW_SEARCH_CACHE_MB or
+// --search-cache-mb.
+const defaultSearchCacheMB = 32
+
+// searchCacheBudgetBytes bounds the windows kept for narrowing. When a search
+// matches more text than this, the windows are dropped wholesale: a partially
+// cached set would make a narrowed search silently miss matches.
+var searchCacheBudgetBytes = int64(defaultSearchCacheMB) << 20
+
+// resolveSearchCacheBudget applies the flag, then the environment variable,
+// then the default. A non-positive value means "not set".
+func resolveSearchCacheBudget(flagMB int) int64 {
+	if flagMB > 0 {
+		return int64(flagMB) << 20
+	}
+	if env := os.Getenv("CCVIEW_SEARCH_CACHE_MB"); env != "" {
+		if mb, err := strconv.Atoi(env); err == nil && mb > 0 {
+			return int64(mb) << 20
+		}
+	}
+	return int64(defaultSearchCacheMB) << 20
+}
 
 // ── Model ──
 
@@ -247,6 +280,7 @@ type historyTitlesLoadedMsg struct {
 
 type contentSearchDoneMsg struct {
 	gen     int
+	query   string // the query this search ran for; input may have moved on
 	results ContentSearchResult
 }
 
@@ -715,10 +749,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case contentSearchDoneMsg:
 		// Async content search completed
 		if msg.gen == m.sessionSearch.gen {
-			m.sessionSearch.matches = msg.results.Matches
-			m.setSearchResults(msg.results.Results)
+			matches, narrowable := budgetedMatches(msg.results.Matches)
+			m.sessionSearch.baseQuery = msg.query
+			m.sessionSearch.baseAll = msg.results.Results
+			m.sessionSearch.matches = matches
+			m.sessionSearch.narrowable = narrowable
+			// The input may have moved on while this was in flight, in which
+			// case the fresh base answers it immediately.
+			m.applyQueryToSearchCache()
+			m.sessionSearch.searching = false
 		}
-		m.sessionSearch.searching = false
 		return m, nil
 
 	case contentLoadedMsg:
@@ -748,25 +788,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollToMatch()
 			}
 		}
-		if msg.kind == "session" && msg.gen == m.sessionSearch.gen {
-			// Content search uses rg/grep which may be slow — run async
-			if m.sessionSearch.contentSearch {
-				m.sessionSearch.searching = true
-				gen := msg.gen
-				query := string(m.sessionSearch.input)
-				scope := m.sessionSearch.scope
-				// Pass providers for the goroutine to search with
-				providers := m.providers
-				var currentDirName string
-				if m.currentProj != nil {
-					currentDirName = m.currentProj.DirName
-				}
-				tabIdx := m.providerTab
-				return m, func() tea.Msg {
-					results := computeContentSearchResults(query, scope, providers, tabIdx, currentDirName)
-					return contentSearchDoneMsg{gen: gen, results: results}
-				}
-			}
+		// Session search only debounces in metadata mode; content mode is
+		// gated behind enter, so nothing schedules a content tick.
+		if msg.kind == "session" && msg.gen == m.sessionSearch.gen && !m.sessionSearch.contentSearch {
 			m.computeSessionSearchResults()
 		}
 		return m, nil
@@ -1489,10 +1513,9 @@ func (m model) handlePaste(raw string) (tea.Model, tea.Cmd) {
 
 	if m.sessionSearch.active {
 		m.sessionSearch.input = append(m.sessionSearch.input, runes...)
-		m.sessionSearch.cursor = 0
-		m.sessionSearch.offset = 0
-		m.sessionSearch.gen++
-		return m, m.sessionSearchDebounceCmd()
+		// A paste edits the query, so it follows the same rule as typing:
+		// content search narrows, metadata search debounces.
+		return m, m.inputChanged()
 	}
 	if m.export.active {
 		// Only the path and filename steps take text; the others have
@@ -1619,6 +1642,11 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.sessionSearch.active = false
 		return m, nil
 	case "enter":
+		// In content search the same key does both jobs, in order: commit a
+		// query that has not been searched yet, then open the selected result.
+		if m.sessionSearch.contentSearch && m.sessionSearch.pending {
+			return m, m.startContentSearch()
+		}
 		if len(m.sessionSearch.results) > 0 && m.sessionSearch.cursor < len(m.sessionSearch.results) {
 			result := m.sessionSearch.results[m.sessionSearch.cursor]
 			m.sessionSearch.active = false
@@ -1626,24 +1654,30 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "tab":
-		// Toggle scope: global ↔ project
+		// Toggle scope: global ↔ project. An explicit action, so it searches
+		// rather than waiting for another enter; only typing is gated.
 		if m.sessionSearch.scope == searchScopeGlobal {
 			m.sessionSearch.scope = searchScopeProject
 		} else {
 			m.sessionSearch.scope = searchScopeGlobal
 		}
+		m.dropSearchBase()
+		if m.sessionSearch.contentSearch {
+			return m, m.startContentSearch()
+		}
 		m.sessionSearch.gen++
 		return m, m.sessionSearchDebounceCmd()
 	case "alt+t":
 		// Switch to title search mode
+		m.dropSearchBase()
 		m.sessionSearch.contentSearch = false
 		m.sessionSearch.gen++
 		return m, m.sessionSearchDebounceCmd()
 	case "alt+c":
 		// Switch to content search mode
+		m.dropSearchBase()
 		m.sessionSearch.contentSearch = true
-		m.sessionSearch.gen++
-		return m, m.sessionSearchDebounceCmd()
+		return m, m.startContentSearch()
 	case "alt+f":
 		// Apply sidebar filter from search results
 		if len(m.sessionSearch.results) > 0 {
@@ -1677,20 +1711,14 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "backspace":
 		if len(m.sessionSearch.input) > 0 {
 			m.sessionSearch.input = m.sessionSearch.input[:len(m.sessionSearch.input)-1]
-			m.sessionSearch.cursor = 0
-			m.sessionSearch.offset = 0
-			m.sessionSearch.gen++
-			return m, m.sessionSearchDebounceCmd()
+			return m, m.inputChanged()
 		}
 		return m, nil
 	default:
 		r := []rune(key)
 		if len(r) == 1 && r[0] >= 32 {
 			m.sessionSearch.input = append(m.sessionSearch.input, r[0])
-			m.sessionSearch.cursor = 0
-			m.sessionSearch.offset = 0
-			m.sessionSearch.gen++
-			return m, m.sessionSearchDebounceCmd()
+			return m, m.inputChanged()
 		}
 		return m, nil
 	}
@@ -1708,6 +1736,60 @@ func (m model) updateSessionSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// inputChanged handles an edit to the search query. Content search narrows the
+// cached result locally and never searches while typing; metadata search is
+// free, so it keeps its debounced as-you-type behaviour.
+func (m *model) inputChanged() tea.Cmd {
+	m.sessionSearch.cursor = 0
+	m.sessionSearch.offset = 0
+	if m.sessionSearch.contentSearch {
+		m.applyQueryToSearchCache()
+		return nil
+	}
+	m.sessionSearch.gen++
+	return m.sessionSearchDebounceCmd()
+}
+
+// startContentSearch runs a full content search for the current query. This is
+// the only path in content mode that touches the disk, and it is reached from
+// explicit actions: enter, and scope or mode changes.
+func (m *model) startContentSearch() tea.Cmd {
+	query := string(m.sessionSearch.input)
+	m.sessionSearch.gen++
+	m.sessionSearch.searching = false
+	m.sessionSearch.incomplete = false
+	if query == "" {
+		m.dropSearchBase()
+		return nil
+	}
+
+	if m.sessionSearch.contentSearch {
+		gen := m.sessionSearch.gen
+		scope := m.sessionSearch.scope
+		providers := m.providers
+		var currentDirName string
+		if m.currentProj != nil {
+			currentDirName = m.currentProj.DirName
+		}
+		tabIdx := m.providerTab
+		m.sessionSearch.searching = true
+		m.sessionSearch.pending = false
+		m.sessionSearch.baseQuery = ""
+		m.sessionSearch.baseAll = nil
+		m.sessionSearch.matches = nil
+		m.sessionSearch.narrowable = false
+		m.clearSearchResults()
+		return func() tea.Msg {
+			return contentSearchDoneMsg{gen: gen, query: query, results: computeContentSearchResults(query, scope, providers, tabIdx, currentDirName)}
+		}
+	}
+
+	// Metadata search runs in memory, so it can run on the spot.
+	m.sessionSearch.incomplete = false
+	m.computeSessionSearchResults()
+	return nil
 }
 
 func (m *model) computeSessionSearchResults() {
@@ -1774,6 +1856,129 @@ func (m *model) computeSessionSearchResults() {
 	}
 	m.setSearchResults(allResults)
 	m.sessionSearch.matches = nil
+}
+
+// budgetedMatches drops the windows when they exceed the cache budget. The
+// caller must fall back to a full search for every later query, because a
+// client that narrows against a partial window set would silently lose
+// matches, and silence is the one failure mode worth avoiding here.
+func budgetedMatches(matches []ContentMatch) ([]ContentMatch, bool) {
+	var total int
+	for _, m := range matches {
+		for _, w := range m.Windows {
+			total += len(w)
+			if int64(total) > searchCacheBudgetBytes {
+				return nil, false
+			}
+		}
+	}
+	return matches, true
+}
+
+// windowHasExtension reports whether w contains baseQuery immediately followed
+// by ext. Every occurrence is tried, not just the first: a line like
+// "ac ab" must match the base query "a" extended to "ab" from its second
+// occurrence.
+func windowHasExtension(w, baseQuery, ext string) bool {
+	for from := 0; from <= len(w)-len(baseQuery); {
+		idx := strings.Index(w[from:], baseQuery)
+		if idx < 0 {
+			return false
+		}
+		start := from + idx + len(baseQuery)
+		if strings.HasPrefix(w[start:], ext) {
+			return true
+		}
+		from = from + idx + 1
+	}
+	return false
+}
+
+// narrowMatches returns the paths whose windows contain query, given that
+// query extends baseQuery. Sound and complete only while the extension is at
+// most contentMatchWindowRunes long and the window set is complete.
+func narrowMatches(matches []ContentMatch, baseQuery, query string) map[string]bool {
+	ext := query[len(baseQuery):]
+	hits := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		for _, w := range m.Windows {
+			if windowHasExtension(w, baseQuery, ext) {
+				hits[m.Path] = true
+				break
+			}
+		}
+	}
+	return hits
+}
+
+// applyQueryToSearchCache refreshes the displayed results for the current input
+// without touching the disk, when the cached base can answer it. The three
+// cases are: the query extends the base (narrow it), the query is a proper
+// prefix of the base (the base results are still valid, just incomplete), or
+// the two diverged (nothing can be shown).
+func (m *model) applyQueryToSearchCache() {
+	st := &m.sessionSearch
+	q := string(st.input)
+
+	switch {
+	case st.baseQuery == "":
+		st.pending = true
+
+	case strings.HasPrefix(q, st.baseQuery):
+		st.incomplete = false
+		if q == st.baseQuery {
+			st.pending = false
+			m.setSearchResults(st.baseAll)
+			return
+		}
+		if !st.narrowable || len([]rune(q))-len([]rune(st.baseQuery)) > contentMatchWindowRunes {
+			// Cannot answer from the windows: the base results are a superset
+			// of this query's, so showing them would be a false positive.
+			m.clearSearchResults()
+			st.pending = true
+			return
+		}
+		hits := narrowMatches(st.matches, st.baseQuery, q)
+		filtered := make([]SearchResult, 0, len(hits))
+		for _, r := range st.baseAll {
+			if hits[r.Path] {
+				filtered = append(filtered, r)
+			}
+		}
+		m.setSearchResults(filtered)
+		st.pending = false
+
+	case strings.HasPrefix(st.baseQuery, q):
+		// Backspacing into the base's own prefix. Every base result still
+		// matches the shorter query, so keeping them is honest as long as the
+		// overlay says they are incomplete.
+		m.setSearchResults(st.baseAll)
+		st.pending = true
+		st.incomplete = true
+
+	default:
+		m.clearSearchResults()
+		st.pending = true
+	}
+}
+
+func (m *model) clearSearchResults() {
+	m.sessionSearch.allResults = nil
+	m.sessionSearch.results = nil
+	m.sessionSearch.cursor = 0
+	m.sessionSearch.offset = 0
+}
+
+// dropSearchBase forgets the cached search, e.g. when the corpus or the
+// matching rule changes underneath it.
+func (m *model) dropSearchBase() {
+	m.sessionSearch.baseQuery = ""
+	m.sessionSearch.baseAll = nil
+	m.sessionSearch.matches = nil
+	m.sessionSearch.narrowable = false
+	m.sessionSearch.pending = true
+	m.sessionSearch.incomplete = false
+	m.clearSearchResults()
 }
 
 // setSearchResults records the complete match set and derives the capped view
@@ -1951,11 +2156,17 @@ func (m model) renderSessionSearchOverlay() string {
 	}
 	inputLine := fmt.Sprintf(" /%s", query+"\u2588")
 	scopeBadge := dimStyle.Render(fmt.Sprintf("[%s %s]", modeLabel, scopeLabel))
-	gap := innerW - lipgloss.Width(inputLine) - lipgloss.Width(scopeBadge)
+	statusBadge := ""
+	if m.sessionSearch.pending && !m.sessionSearch.searching {
+		// Whatever is listed below came from an earlier query. Say so, rather
+		// than let it read as an answer to this one.
+		statusBadge = " " + statusHighlight.Render("enter to search again")
+	}
+	gap := innerW - lipgloss.Width(inputLine) - lipgloss.Width(scopeBadge) - lipgloss.Width(statusBadge)
 	if gap < 1 {
 		gap = 1
 	}
-	lines = append(lines, inputLine+strings.Repeat(" ", gap)+scopeBadge)
+	lines = append(lines, inputLine+strings.Repeat(" ", gap)+scopeBadge+statusBadge)
 	lines = append(lines, faintStyle.Render(strings.Repeat("\u2500", innerW)))
 
 	// Results
@@ -1966,12 +2177,21 @@ func (m model) renderSessionSearchOverlay() string {
 	if m.sessionSearch.searching {
 		lines = append(lines, dimStyle.Render(" Searching..."))
 	} else if len(m.sessionSearch.results) == 0 {
-		if len(query) > 0 {
-			lines = append(lines, dimStyle.Render(" No matches found"))
-		} else {
+		switch {
+		case len(query) == 0:
 			lines = append(lines, dimStyle.Render(" Type to search..."))
+		case m.sessionSearch.pending:
+			// Nothing has been searched for this query yet. Saying "no
+			// matches" here would be a lie.
+			lines = append(lines, dimStyle.Render(" enter to search again"))
+		default:
+			lines = append(lines, dimStyle.Render(" No matches found"))
 		}
-	} else {
+	} else if m.sessionSearch.incomplete {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf(" %d from the shorter query, incomplete", len(m.sessionSearch.results))))
+	}
+
+	if len(m.sessionSearch.results) > 0 {
 		end := m.sessionSearch.offset + maxVisible
 		if end > len(m.sessionSearch.results) {
 			end = len(m.sessionSearch.results)
@@ -2035,7 +2255,11 @@ func (m model) renderSessionSearchOverlay() string {
 
 	lines = append(lines, "")
 	resultCount := len(m.sessionSearch.results)
-	hint := fmt.Sprintf(" %d results  ↑↓:navigate  enter:open  alt+f:filter  alt+t:title  alt+c:content  tab:scope  esc:close", resultCount)
+	enterLabel := "enter:open"
+	if m.sessionSearch.pending {
+		enterLabel = "enter:search"
+	}
+	hint := fmt.Sprintf(" %d results  ↑↓:navigate  %s  alt+f:filter  alt+t:title  alt+c:content  tab:scope  esc:close", resultCount, enterLabel)
 	lines = append(lines, dimStyle.Render(hint))
 
 	overlayBox := lipgloss.NewStyle().

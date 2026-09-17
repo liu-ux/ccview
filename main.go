@@ -30,7 +30,10 @@ func main() {
 	port := flag.Int("port", 3333, "Port for web server (used with --web)")
 	debugLog := flag.String("debug", "", "Write debug timing logs to this file")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	searchCacheMB := flag.Int("search-cache-mb", 0, "Search cache size in MB, for narrowing a content search as you type (overrides CCVIEW_SEARCH_CACHE_MB; default 32)")
 	flag.Parse()
+
+	searchCacheBudgetBytes = resolveSearchCacheBudget(*searchCacheMB)
 
 	if *showVersion {
 		fmt.Println("ccview", version)

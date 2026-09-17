@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -392,4 +393,339 @@ func TestSearchContentInFiles_LiteralThroughRg(t *testing.T) {
 	if matches[abc] {
 		t.Error(". must not act as a regex wildcard")
 	}
+}
+
+// ── Prefix narrowing ──
+
+func TestWindowHasExtension(t *testing.T) {
+	tests := []struct {
+		name   string
+		window string
+		base   string
+		ext    string
+		want   bool
+	}{
+		{"only occurrence", "a needle", "a", " n", true},
+		{"extension only at the second occurrence", "ac ab", "a", "b", true},
+		{"no occurrence carries the extension", "ac ad", "a", "b", false},
+		{"base absent", "xyz", "a", "b", false},
+		{"overlapping occurrences", "aaa", "aa", "a", true},
+		{"empty extension always matches", "anything", "thing", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := windowHasExtension(tc.window, tc.base, tc.ext); got != tc.want {
+				t.Errorf("windowHasExtension(%q, %q, %q) = %v, want %v", tc.window, tc.base, tc.ext, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBudgetedMatches(t *testing.T) {
+	old := searchCacheBudgetBytes
+	defer func() { searchCacheBudgetBytes = old }()
+
+	searchCacheBudgetBytes = 100
+	if _, ok := budgetedMatches([]ContentMatch{{Path: "a", Windows: []string{strings.Repeat("x", 100)}}}); !ok {
+		t.Error("a set within budget must be kept")
+	}
+	got, ok := budgetedMatches([]ContentMatch{{Path: "a", Windows: []string{strings.Repeat("x", 101)}}})
+	if ok || got != nil {
+		t.Errorf("an over-budget set must be dropped whole, got ok=%v %v", ok, got)
+	}
+	// One oversized entity must not leave the rest partially cached.
+	got, ok = budgetedMatches([]ContentMatch{
+		{Path: "a", Windows: []string{"small"}},
+		{Path: "b", Windows: []string{strings.Repeat("x", 200)}},
+	})
+	if ok || got != nil {
+		t.Errorf("partial caching is unsound, got ok=%v %v", ok, got)
+	}
+}
+
+func TestResolveSearchCacheBudget(t *testing.T) {
+	oldEnv, hadEnv := os.LookupEnv("CCVIEW_SEARCH_CACHE_MB")
+	defer func() {
+		if hadEnv {
+			os.Setenv("CCVIEW_SEARCH_CACHE_MB", oldEnv)
+		} else {
+			os.Unsetenv("CCVIEW_SEARCH_CACHE_MB")
+		}
+	}()
+
+	os.Unsetenv("CCVIEW_SEARCH_CACHE_MB")
+	if got := resolveSearchCacheBudget(0); got != int64(defaultSearchCacheMB)<<20 {
+		t.Errorf("default = %d, want %d MB", got, defaultSearchCacheMB)
+	}
+	os.Setenv("CCVIEW_SEARCH_CACHE_MB", "7")
+	if got := resolveSearchCacheBudget(0); got != 7<<20 {
+		t.Errorf("env = %d, want 7 MB", got)
+	}
+	if got := resolveSearchCacheBudget(3); got != 3<<20 {
+		t.Errorf("flag = %d, want 3 MB (flag must win over env)", got)
+	}
+	os.Setenv("CCVIEW_SEARCH_CACHE_MB", "not-a-number")
+	if got := resolveSearchCacheBudget(0); got != int64(defaultSearchCacheMB)<<20 {
+		t.Errorf("bad env = %d, want the default", got)
+	}
+}
+
+// searchStateWithBase is a model whose last content search ran for "needle".
+func searchStateWithBase() model {
+	return model{
+		height: 40,
+		width:  100,
+		sessionSearch: sessionSearchState{
+			active:        true,
+			contentSearch: true,
+			input:         []rune("needle"),
+			baseQuery:     "needle",
+			baseAll: []SearchResult{
+				{Path: "a.jsonl", Title: "A", ModTime: "2026-01-01T00:00:02Z"},
+				{Path: "b.jsonl", Title: "B", ModTime: "2026-01-01T00:00:01Z"},
+			},
+			matches: []ContentMatch{
+				{Path: "a.jsonl", Windows: []string{"needle in a haystack"}},
+				{Path: "b.jsonl", Windows: []string{"needle"}},
+			},
+			narrowable: true,
+		},
+	}
+}
+
+func TestApplyQueryToSearchCache(t *testing.T) {
+	t.Run("no base leaves the query pending", func(t *testing.T) {
+		m := model{sessionSearch: sessionSearchState{active: true, contentSearch: true, input: []rune("x")}}
+		m.applyQueryToSearchCache()
+		if !m.sessionSearch.pending {
+			t.Error("a query with no base must be pending")
+		}
+	})
+
+	t.Run("extension narrows", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.sessionSearch.input = []rune("needle in")
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 1 || m.sessionSearch.allResults[0].Path != "a.jsonl" {
+			t.Errorf("narrowed results = %+v, want only a.jsonl", m.sessionSearch.allResults)
+		}
+		if m.sessionSearch.pending || m.sessionSearch.incomplete {
+			t.Error("a narrowed query is neither pending nor incomplete")
+		}
+	})
+
+	t.Run("query equal to the base restores every result", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.clearSearchResults()
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 2 {
+			t.Errorf("results = %d, want the full base set", len(m.sessionSearch.allResults))
+		}
+		if m.sessionSearch.pending {
+			t.Error("the base query has been searched")
+		}
+	})
+
+	t.Run("backspacing into the base prefix keeps results but flags them incomplete", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.sessionSearch.input = []rune("need")
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 2 {
+			t.Errorf("results = %d, want the base set kept", len(m.sessionSearch.allResults))
+		}
+		if !m.sessionSearch.pending || !m.sessionSearch.incomplete {
+			t.Error("a query shorter than the base is pending and incomplete")
+		}
+		if got := m.renderSessionSearchOverlay(); strings.Contains(got, "No matches found") {
+			t.Error("showing valid-but-incomplete results must not also say there are none")
+		}
+	})
+
+	t.Run("divergence clears the display", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.sessionSearch.input = []rune("dle")
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 0 {
+			t.Errorf("results = %+v, want none", m.sessionSearch.allResults)
+		}
+		if !m.sessionSearch.pending || m.sessionSearch.incomplete {
+			t.Error("a diverged query is pending, and what was shown was not a subset")
+		}
+	})
+
+	t.Run("extension without windows clears instead of showing a superset", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.sessionSearch.narrowable = false
+		m.sessionSearch.input = []rune("needle in")
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 0 {
+			t.Errorf("results = %+v, want none: base results are a superset here", m.sessionSearch.allResults)
+		}
+		if !m.sessionSearch.pending {
+			t.Error("must wait for enter")
+		}
+	})
+
+	t.Run("extension beyond the window clears", func(t *testing.T) {
+		m := searchStateWithBase()
+		m.sessionSearch.input = []rune("needle" + strings.Repeat("x", contentMatchWindowRunes+1))
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 0 || !m.sessionSearch.pending {
+			t.Errorf("an extension past the window cannot be answered from the cache: %+v", m.sessionSearch.allResults)
+		}
+	})
+
+	t.Run("exactly at the window still narrows", func(t *testing.T) {
+		window := "needle" + strings.Repeat("x", contentMatchWindowRunes)
+		m := searchStateWithBase()
+		m.sessionSearch.matches = []ContentMatch{{Path: "a.jsonl", Windows: []string{window}}}
+		m.sessionSearch.baseAll = []SearchResult{{Path: "a.jsonl"}}
+		m.sessionSearch.input = []rune(window)
+		m.applyQueryToSearchCache()
+		if len(m.sessionSearch.allResults) != 1 || m.sessionSearch.pending {
+			t.Error("an extension of exactly contentMatchWindowRunes must still narrow")
+		}
+	})
+}
+
+func TestSearchDisplayLimit_KeepsNarrowingReachable(t *testing.T) {
+	const total = 60
+	m := model{sessionSearch: sessionSearchState{active: true, contentSearch: true}}
+	for i := 0; i < total; i++ {
+		path := fmt.Sprintf("c%02d.jsonl", i)
+		// c00 sorts last (oldest), so it falls outside the displayed page.
+		m.sessionSearch.baseAll = append(m.sessionSearch.baseAll,
+			SearchResult{Path: path, ModTime: fmt.Sprintf("2026-01-01T00:00:%02dZ", i)})
+		window := "needle"
+		if i == 0 {
+			window = "needle xyz"
+		}
+		m.sessionSearch.matches = append(m.sessionSearch.matches, ContentMatch{Path: path, Windows: []string{window}})
+	}
+	m.sessionSearch.input = []rune("needle")
+	m.sessionSearch.baseQuery = "needle"
+	m.sessionSearch.narrowable = true
+	m.setSearchResults(m.sessionSearch.baseAll)
+
+	if len(m.sessionSearch.results) != searchDisplayLimit {
+		t.Fatalf("displayed %d results, want %d", len(m.sessionSearch.results), searchDisplayLimit)
+	}
+	for _, r := range m.sessionSearch.results {
+		if r.Path == "c00.jsonl" {
+			t.Fatal("c00.jsonl should be past the display cap")
+		}
+	}
+
+	m.sessionSearch.input = []rune("needle xyz")
+	m.applyQueryToSearchCache()
+	if len(m.sessionSearch.allResults) != 1 || m.sessionSearch.allResults[0].Path != "c00.jsonl" {
+		t.Errorf("narrowing must reach matches past the display cap, got %+v", m.sessionSearch.allResults)
+	}
+}
+
+func TestSessionSearch_EnterGate(t *testing.T) {
+	keyMsg := func(r rune) tea.Msg { return tea.KeyPressMsg{Code: r, Text: string(r)} }
+	update := func(m model, msg tea.Msg) (model, tea.Cmd) {
+		got, cmd := m.Update(msg)
+		return got.(model), cmd
+	}
+
+	m := model{height: 40, width: 100, sessionSearch: sessionSearchState{active: true, contentSearch: true}}
+	m, cmd := update(m, keyMsg('n'))
+	if cmd != nil {
+		t.Error("typing in content mode must not start a search")
+	}
+	if !m.sessionSearch.pending {
+		t.Error("the query should be pending until enter")
+	}
+	if got := m.renderSessionSearchOverlay(); strings.Contains(got, "No matches found") {
+		t.Error("the overlay must not claim there are no matches before searching")
+	}
+
+	m, cmd = update(m, tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("enter must start the content search")
+	}
+	if !m.sessionSearch.searching {
+		t.Error("the overlay should show that a search is running")
+	}
+
+	// Metadata search keeps searching as you type: it costs nothing.
+	title := model{height: 40, width: 100, sessionSearch: sessionSearchState{active: true}}
+	if _, cmd := update(title, keyMsg('n')); cmd == nil {
+		t.Error("metadata search should still debounce while typing")
+	}
+
+	// Explicit actions search rather than waiting for another enter.
+	base := searchStateWithBase()
+	base, cmd = update(base, tea.KeyPressMsg{Code: tea.KeyTab})
+	if cmd == nil {
+		t.Error("switching scope must search immediately")
+	}
+	if base.sessionSearch.baseQuery != "" {
+		t.Error("switching scope must drop the stale base")
+	}
+	base = searchStateWithBase()
+	base, cmd = update(base, tea.KeyPressMsg{Code: 'c', Mod: tea.ModAlt})
+	if cmd == nil {
+		t.Error("switching to content mode must search immediately")
+	}
+}
+
+func TestSessionSearchOverlay_ExplainsIncompleteResults(t *testing.T) {
+	m := searchStateWithBase()
+	m.sessionSearch.input = []rune("need")
+	m.applyQueryToSearchCache()
+	got := m.renderSessionSearchOverlay()
+	if !strings.Contains(got, "enter to search again") {
+		t.Errorf("overlay should say how to get complete results:\n%s", got)
+	}
+	if !strings.Contains(got, "enter:search") {
+		t.Errorf("hint line should say enter searches, not opens:\n%s", got)
+	}
+}
+
+// The property the whole cache rests on, checked against whatever corpus this
+// machine has: narrowing a short query's windows must find exactly the
+// entities a full search for the longer query finds — no misses, no
+// inventions. Skips when there is no corpus to check against.
+func TestNarrowing_AgreesWithFullSearchOnRealCorpus(t *testing.T) {
+	if testing.Short() {
+		t.Skip("reads the local corpus")
+	}
+	home, _ := os.UserHomeDir()
+	if _, err := os.Stat(filepath.Join(home, ".claude", "projects")); err != nil {
+		t.Skip("no local corpus")
+	}
+	p := &ClaudeProvider{}
+	pairs := [][2]string{
+		{"Compaction", "Compaction canceled"},
+		{"Api key", "Api key is invalid"},
+	}
+	checked := 0
+	for _, pair := range pairs {
+		base, ext := pair[0], pair[1]
+		baseRes := p.ContentSearch(base, "")
+		full := p.ContentSearch(ext, "")
+		narrowed := narrowMatches(baseRes.Matches, base, ext)
+		if len(full.Results) == 0 {
+			continue
+		}
+		checked++
+		fullSet := make(map[string]bool, len(full.Results))
+		for _, r := range full.Results {
+			fullSet[r.Path] = true
+		}
+		for path := range fullSet {
+			if !narrowed[path] {
+				t.Errorf("narrowing %q to %q missed %s", base, ext, path)
+			}
+		}
+		for path := range narrowed {
+			if !fullSet[path] {
+				t.Errorf("narrowing %q to %q invented %s", base, ext, path)
+			}
+		}
+	}
+	t.Logf("checked %d prefix pairs", checked)
 }
