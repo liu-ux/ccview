@@ -33,26 +33,35 @@ release:
   header: |
     ## What's New
 
-    ### Performance
-    - **3-level lazy loading** — startup is instant; project metadata loads in the background, conversations load on demand per-project
-
-    ### Project List
-    - **Inline filter** — press `f` to filter projects by name; case-insensitive substring match, persists across navigation
-    - **`-project` flag** — jump directly to a project: `ccview -project my-app`
+    ### Paste
+    - **Paste works in every text input** — session search, content search, the project filter, and the export wizard's path and filename fields. Newlines and tabs collapse to single spaces, control characters are dropped, and long pastes are capped at 1024 characters
 
     ### Conversation Viewer
-    - **Tool call detail toggle** — press `t` to expand tool inputs, `T` for thinking blocks, `R` for inline tool results
-    - **Split-pane rendering** — tool results render inline below their matching tool call
-    - **Content search** — press `/` in the viewer for live search with `n`/`N` match navigation
-    - **Turn numbers** — each message displays its conversation turn number in the header
-    - **Turn navigation** — press `[`/`]` to jump to previous/next turn; press `\` + number + Enter to jump to a specific turn
+    - **Turn numbers** — each message shows its conversation turn number in its header
+    - **Turn navigation** — `[` / `]` jump to the previous / next turn; `\` + number + Enter jumps to a specific turn
+    - **System entries are visible** — command output, compaction boundaries, turn durations and API errors (`type: "system"`) now render in the viewer, in HTML and Markdown exports, and in the web UI
+    - **`S` toggles them** — shown by default; a subtype this build does not know about renders generically rather than vanishing
+    - **`t` / `T` / `R`** — expand tool inputs, thinking blocks and inline tool results
 
     ### Search
-    - **Session search overlay** — press `/` from the project list (global) or sidebar (project-scoped)
-    - **Content scope toggle** — `Tab` switches between title search and full-content search (ripgrep/grep/SQL)
-    - **Sidebar filter** — press `Alt+F` in search results to filter the sidebar to matching sessions
+    - **Content search waits for `Enter`** — it used to re-scan every conversation on disk on a debounce after each pause. Now `Enter` searches and typing narrows the previous result locally, so the list stops flickering through `Searching...`
+    - **Narrowing is exact**, up to 50 characters past the searched query; past that, `Enter` searches again. `--search-cache-mb` (or `CCVIEW_SEARCH_CACHE_MB`, default 32MB) bounds the cache
+    - **One matching rule** — the query is literal and case-sensitive on every backend, so `50%`, `a.c` and `(` mean what they say instead of depending on which of ripgrep, grep or the Go fallback happened to run
+    - **Results are complete before display** — the 50-row list is a display cap, not a search cap, so narrowing can still reach a match past it
+
+    ### Behavior Changes
+    - Content search no longer accepts regular expressions. It never advertised them, and the three backends disagreed on what they meant: ripgrep took the query as a regex, the Go fallback matched it case-insensitively, and OpenCode's `LIKE` treated `%` and `_` as wildcards
+    - `Enter` in the search overlay searches when the query has not been run yet, and opens the selected session afterwards. The overlay says which one it will do, and no longer answers "No matches found" for a query it has not searched
+
+    ### Also Included
+    - **3-level lazy loading** — startup is instant; project metadata loads in the background, conversations load on demand per-project
+    - **Inline project filter** (`f`), **`-project` flag**, and **`--search-cache-mb`**
+    - **Session search overlay** — `/` from the project list (global) or sidebar (project-scoped), `Tab` for scope, `alt+t` / `alt+c` for title or content mode, `alt+f` to filter the sidebar to the results
 
     ### Bug Fixes
+    - Fixed pasted text being silently dropped in every TUI text input: bracketed paste arrives as its own event, which no input had a case for
+    - Fixed `%` and `_` acting as wildcards when searching OpenCode sessions
+    - Fixed content search results being truncated to 50 before sorting, and at the provider rather than at display
     - Fixed Windows installer path handling
   github:
     owner: liu-ux
