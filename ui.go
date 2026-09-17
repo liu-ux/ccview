@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -122,7 +123,6 @@ type model struct {
 	// Content search
 	contentSearchActive bool
 	contentSearchInput  []rune
-	contentSearchPos    int
 	contentMatches      []int  // line indices with matches
 	contentMatchIdx     int    // current match index
 	contentSearchQuery  string // for highlighting
@@ -798,6 +798,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseWheelMsg:
 		return m.handleMouseWheel(msg)
 
+	case tea.PasteMsg:
+		return m.handlePaste(msg.String())
+
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -1278,7 +1281,6 @@ func (m model) updateContent(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if len(m.contentLines) > 0 {
 			m.contentSearchActive = true
 			m.contentSearchInput = nil
-			m.contentSearchPos = 0
 			return m, nil
 		}
 	case "n":
@@ -1401,6 +1403,97 @@ func (m model) updateJumpMode(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+}
+
+// maxPasteLen caps pasted text so a huge paste cannot blow past the OS
+// command-line limit when the search is executed via rg/grep.
+const maxPasteLen = 1024
+
+// sanitizePaste normalizes pasted text into a single-line query: whitespace
+// runs (including newlines and tabs) collapse to one space, other control
+// characters are dropped, leading/trailing whitespace is removed, and the
+// result is capped at maxPasteLen runes.
+func sanitizePaste(s string) string {
+	var b strings.Builder
+	pendingSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if b.Len() > 0 {
+				pendingSpace = true
+			}
+			continue
+		}
+		if r < 32 || r == 127 {
+			continue // drop other control characters
+		}
+		if pendingSpace {
+			b.WriteRune(' ')
+			pendingSpace = false
+		}
+		b.WriteRune(r)
+	}
+	runes := []rune(b.String())
+	if len(runes) > maxPasteLen {
+		runes = runes[:maxPasteLen]
+	}
+	return string(runes)
+}
+
+// insertAtCursor splices text into buf at pos and returns the new buffer along
+// with the cursor position just past the inserted text.
+func insertAtCursor(buf []rune, pos int, text []rune) ([]rune, int) {
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(buf) {
+		pos = len(buf)
+	}
+	out := make([]rune, 0, len(buf)+len(text))
+	out = append(out, buf[:pos]...)
+	out = append(out, text...)
+	out = append(out, buf[pos:]...)
+	return out, pos + len(text)
+}
+
+// handlePaste routes bracketed-paste text to whichever input has focus.
+// Bubble Tea delivers pasted text as its own tea.PasteMsg, never as a run of
+// tea.KeyPressMsg, so every text input needs an explicit case here.
+func (m model) handlePaste(raw string) (tea.Model, tea.Cmd) {
+	text := sanitizePaste(raw)
+	if text == "" {
+		return m, nil
+	}
+	runes := []rune(text)
+
+	if m.sessionSearch.active {
+		m.sessionSearch.input = append(m.sessionSearch.input, runes...)
+		m.sessionSearch.cursor = 0
+		m.sessionSearch.offset = 0
+		m.sessionSearch.gen++
+		return m, m.sessionSearchDebounceCmd()
+	}
+	if m.export.active {
+		// Only the path and filename steps take text; the others have
+		// nothing to paste into.
+		switch m.export.step {
+		case exportStepPath:
+			m.export.pathBuf, m.export.pathCurPos = insertAtCursor(m.export.pathBuf, m.export.pathCurPos, runes)
+		case exportStepFilename:
+			m.export.filenameBuf, m.export.filenameCurPos = insertAtCursor(m.export.filenameBuf, m.export.filenameCurPos, runes)
+		}
+		return m, nil
+	}
+	if m.contentSearchActive {
+		m.contentSearchInput = append(m.contentSearchInput, runes...)
+		m.contentSearchGen++
+		return m, m.contentSearchDebounceCmd()
+	}
+	if m.projectFilterActive {
+		m.projectFilter = append(m.projectFilter, runes...)
+		m.projCursor = 0
+		m.projOffset = 0
+	}
+	return m, nil
 }
 
 func (m model) contentSearchDebounceCmd() tea.Cmd {
@@ -2299,8 +2392,7 @@ func (m model) updateExportOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		default:
 			r := []rune(key)
 			if len(r) == 1 && r[0] >= 32 {
-				m.export.pathBuf = append(m.export.pathBuf[:m.export.pathCurPos], append([]rune{r[0]}, m.export.pathBuf[m.export.pathCurPos:]...)...)
-				m.export.pathCurPos++
+				m.export.pathBuf, m.export.pathCurPos = insertAtCursor(m.export.pathBuf, m.export.pathCurPos, r)
 			}
 		}
 
@@ -2330,8 +2422,7 @@ func (m model) updateExportOverlay(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		default:
 			r := []rune(key)
 			if len(r) == 1 && r[0] >= 32 {
-				m.export.filenameBuf = append(m.export.filenameBuf[:m.export.filenameCurPos], append([]rune{r[0]}, m.export.filenameBuf[m.export.filenameCurPos:]...)...)
-				m.export.filenameCurPos++
+				m.export.filenameBuf, m.export.filenameCurPos = insertAtCursor(m.export.filenameBuf, m.export.filenameCurPos, r)
 			}
 		}
 
